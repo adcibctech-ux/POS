@@ -1,0 +1,421 @@
+/***************************************************************
+ * SCRIPT: POS-2-SquareLookup-v26.0.0
+ * SYSTEM: ADC|IBC POS Backend
+ * TABLE(S): SYNC LOG, TRANSACTIONS
+ *
+ * PURPOSE:
+ * Reads a SYNC LOG webhook record, retrieves the related Square
+ * payment from the Square Sandbox Payments API, optionally retrieves
+ * the related Square order from the Square Sandbox Orders API, and
+ * creates or updates the parent TRANSACTIONS record in Airtable.
+ *
+ * VERSIONING:
+ * POS-2-SquareLookup-v26.0.0
+ *
+ * Version format:
+ * - First digit: major POS workflow/script number.
+ * - Second digit: major structural version.
+ * - Third digit: revision number.
+ *
+ * For this script family, POS-2 remains constant.
+ * Increment the third digit for each revision:
+ * - POS-2-SquareLookup-v26.0.0 = first iteration
+ *
+ * SCRIPT BEHAVIOR:
+ * 1. Reads the triggering SYNC LOG record ID from the Airtable
+ *    automation input variable named `syncLogRecordId`.
+ * 2. Reads Square Object ID from the triggering SYNC LOG record.
+ * 3. Treats Square Object ID as the Square Payment ID for payment
+ *    webhook events.
+ * 4. Calls the Square Sandbox Payments API to retrieve payment details.
+ * 5. If the payment has a Square Order ID, calls the Square Sandbox
+ *    Orders API to retrieve order details.
+ * 6. Searches TRANSACTIONS for an existing record with the same
+ *    Square Payment ID.
+ * 7. Updates the existing TRANSACTIONS record if found.
+ * 8. Creates a new TRANSACTIONS record if no matching Square Payment ID
+ *    exists.
+ * 9. Links the TRANSACTIONS record back to the triggering SYNC LOG record.
+ * 10. Stores combined Square payment/order API response JSON in
+ *     SYNC LOG.Raw API Response.
+ * 11. Sets SYNC LOG.Processing Status to Processed on success.
+ * 12. Sets SYNC LOG.Automation Step to Payment Retrieved on success.
+ * 13. Sets TRANSACTIONS.Import Status to API Retrieved on success.
+ * 14. Checks TRANSACTIONS.Transaction Processed? after parent
+ *     transaction creation/update succeeds.
+ * 15. Does not create TRANSACTION LINES.
+ * 16. Does not create INVENTORY MOVEMENTS.
+ *
+ * BUG FIXES / REVISION NOTES:
+ * v26.0.0
+ * - Initial Square API lookup script.
+ * - Added Square Sandbox Payments API retrieval.
+ * - Added optional Square Sandbox Orders API retrieval.
+ * - Added parent TRANSACTIONS create/update by Square Payment ID.
+ * - Added SYNC LOG back-linking to created/updated transaction.
+ * - Added Raw API Response storage.
+ * - Added basic error handling and SYNC LOG failure updates.
+ *
+ * REQUIRED AIRTABLE AUTOMATION INPUTS:
+ * - syncLogRecordId: Record ID of the triggering SYNC LOG record.
+ *
+ * REQUIRED AIRTABLE SECRET:
+ * - SQUARE_SANDBOX_ACCESS_TOKEN
+ *
+ * REQUIRED TABLES:
+ * - SYNC LOG
+ * - TRANSACTIONS
+ *
+ * REQUIRED SYNC LOG FIELDS:
+ * - Square Event ID
+ * - Processing Status
+ * - Event Type
+ * - Square Object ID
+ * - Related Transaction
+ * - Raw API Response
+ * - Error Message
+ * - Automation Step
+ * - Retry Count
+ * - Last Retry At
+ * - Resolved?
+ *
+ * REQUIRED TRANSACTIONS FIELDS:
+ * - Square Payment ID
+ * - Square Transaction ID
+ * - Square Order ID
+ * - Transaction Timestamp
+ * - Payment Status
+ * - Payment Type 
+ * - Gross Sale
+ * - Tax Total
+ * - Discount Total
+ * - Processing Fee
+ * - Net Total
+ * - Square Location ID
+ * - Square Staff ID
+ * - Square Device ID
+ * - Square Location Name
+ * - Square Device Name
+ * - Card Brand
+ * - Receipt URL
+ * - Import Status
+ * - Raw Payload
+ * - Webhook Events
+ * - Primary Webhook Event ID
+ * - Transaction Processed?
+ ***************************************************************/
+
+const config = input.config();
+
+const syncLogRecordId = config.syncLogRecordId;
+const squareAccessToken = input.secret("SQUARE_SANDBOX_ACCESS_TOKEN");
+
+const SQUARE_API_VERSION = "2026-05-20";
+const SQUARE_BASE_URL = "https://connect.squareupsandbox.com";
+
+const SYNC_LOG_TABLE = "SYNC LOG";
+const TRANSACTIONS_TABLE = "TRANSACTIONS";
+
+// SYNC LOG fields
+const SL_SQUARE_EVENT_ID = "Square Event ID";
+const SL_PROCESSING_STATUS = "Processing Status";
+const SL_EVENT_TYPE = "Event Type";
+const SL_SQUARE_OBJECT_ID = "Square Object ID";
+const SL_RELATED_TRANSACTION = "Related Transaction";
+const SL_RAW_API_RESPONSE = "Raw API Response";
+const SL_ERROR_MESSAGE = "Error Message";
+const SL_AUTOMATION_STEP = "Automation Step";
+const SL_RETRY_COUNT = "Retry Count";
+const SL_LAST_RETRY_AT = "Last Retry At";
+const SL_RESOLVED = "Resolved?";
+
+// TRANSACTIONS fields
+const TX_SQUARE_PAYMENT_ID = "Square Payment ID";
+const TX_SQUARE_TRANSACTION_ID = "Square Transaction ID";
+const TX_SQUARE_ORDER_ID = "Square Order ID";
+const TX_TRANSACTION_TIMESTAMP = "Transaction Timestamp";
+const TX_PAYMENT_STATUS = "Payment Status";
+const TX_PAYMENT_TYPE = "Payment Type ";
+const TX_GROSS_SALE = "Gross Sale";
+const TX_TAX_TOTAL = "Tax Total";
+const TX_DISCOUNT_TOTAL = "Discount Total";
+const TX_PROCESSING_FEE = "Processing Fee";
+const TX_NET_TOTAL = "Net Total";
+const TX_SQUARE_LOCATION_ID = "Square Location ID";
+const TX_SQUARE_STAFF_ID = "Square Staff ID";
+const TX_SQUARE_DEVICE_ID = "Square Device ID";
+const TX_SQUARE_LOCATION_NAME = "Square Location Name";
+const TX_SQUARE_DEVICE_NAME = "Square Device Name";
+const TX_CARD_BRAND = "Card Brand";
+const TX_RECEIPT_URL = "Receipt URL";
+const TX_IMPORT_STATUS = "Import Status";
+const TX_RAW_PAYLOAD = "Raw Payload";
+const TX_WEBHOOK_EVENTS = "Webhook Events";
+const TX_PRIMARY_WEBHOOK_EVENT_ID = "Primary Webhook Event ID";
+const TX_TRANSACTION_PROCESSED = "Transaction Processed?";
+
+// Select values
+const STATUS_PROCESSED = "Processed";
+const STATUS_FAILED = "Failed";
+
+const STEP_PAYMENT_RETRIEVED = "Payment Retrieved";
+const STEP_FAILED = "Failed";
+
+const IMPORT_STATUS_API_RETRIEVED = "API Retrieved";
+const IMPORT_STATUS_FAILED = "Failed";
+
+const syncLogTable = base.getTable(SYNC_LOG_TABLE);
+const transactionsTable = base.getTable(TRANSACTIONS_TABLE);
+
+function stringifySafe(value) {
+    try {
+        return JSON.stringify(value, null, 2);
+    } catch (error) {
+        return String(value);
+    }
+}
+
+function centsToDollars(moneyObject) {
+    if (!moneyObject || typeof moneyObject.amount !== "number") {
+        return null;
+    }
+
+    return moneyObject.amount / 100;
+}
+
+function sumMoneyArray(moneyArray) {
+    if (!Array.isArray(moneyArray)) {
+        return 0;
+    }
+
+    return moneyArray.reduce((sum, item) => {
+        return sum + (item?.amount_money?.amount || 0);
+    }, 0) / 100;
+}
+
+function getPaymentIdFromSyncLog(syncLogRecord) {
+    return syncLogRecord.getCellValueAsString(SL_SQUARE_OBJECT_ID).trim();
+}
+
+function getSquareEventIdFromSyncLog(syncLogRecord) {
+    return syncLogRecord.getCellValueAsString(SL_SQUARE_EVENT_ID).trim();
+}
+
+async function squareGet(path) {
+    const response = await fetch(`${SQUARE_BASE_URL}${path}`, {
+        method: "GET",
+        headers: {
+            "Square-Version": SQUARE_API_VERSION,
+            "Authorization": `Bearer ${squareAccessToken}`,
+            "Content-Type": "application/json"
+        }
+    });
+
+    const responseText = await response.text();
+
+    let responseJson;
+    try {
+        responseJson = JSON.parse(responseText);
+    } catch (error) {
+        responseJson = {
+            rawResponseText: responseText
+        };
+    }
+
+    if (!response.ok) {
+        throw new Error(
+            `Square API request failed for ${path}. Status ${response.status}: ${stringifySafe(responseJson)}`
+        );
+    }
+
+    return responseJson;
+}
+
+async function findTransactionByPaymentId(squarePaymentId) {
+    const transactionRecords = await transactionsTable.selectRecordsAsync({
+        fields: [TX_SQUARE_PAYMENT_ID]
+    });
+
+    return transactionRecords.records.find(record => {
+        return record.getCellValueAsString(TX_SQUARE_PAYMENT_ID) === squarePaymentId;
+    }) || null;
+}
+
+function getOrderTotal(order, moneyFieldName) {
+    return centsToDollars(order?.[moneyFieldName]);
+}
+
+function buildTransactionFields({
+    payment,
+    order,
+    syncLogRecordId,
+    squareEventId,
+    rawApiResponseText
+}) {
+    const processingFeeTotal = sumMoneyArray(payment.processing_fee);
+
+    const grossSale =
+        getOrderTotal(order, "total_money") ??
+        centsToDollars(payment.total_money) ??
+        centsToDollars(payment.amount_money);
+
+    const taxTotal = getOrderTotal(order, "total_tax_money") ?? 0;
+    const discountTotal = getOrderTotal(order, "total_discount_money") ?? 0;
+
+    const netTotal =
+        centsToDollars(payment.total_money) ??
+        centsToDollars(payment.amount_money) ??
+        grossSale;
+
+    const paymentType =
+        payment.source_type ||
+        payment.card_details?.entry_method ||
+        "";
+
+    const cardBrand =
+        payment.card_details?.card?.card_brand ||
+        "";
+
+    return {
+        [TX_SQUARE_PAYMENT_ID]: payment.id || "",
+        [TX_SQUARE_TRANSACTION_ID]: payment.id || "",
+        [TX_SQUARE_ORDER_ID]: payment.order_id || "",
+        [TX_TRANSACTION_TIMESTAMP]: payment.created_at || null,
+        [TX_PAYMENT_STATUS]: payment.status ? { name: payment.status } : null,
+        [TX_PAYMENT_TYPE]: paymentType ? { name: paymentType } : null,
+        [TX_GROSS_SALE]: grossSale ?? null,
+        [TX_TAX_TOTAL]: taxTotal ?? 0,
+        [TX_DISCOUNT_TOTAL]: discountTotal ?? 0,
+        [TX_PROCESSING_FEE]: processingFeeTotal ?? 0,
+        [TX_NET_TOTAL]: netTotal ?? null,
+        [TX_SQUARE_LOCATION_ID]: payment.location_id || order?.location_id || "",
+        [TX_SQUARE_STAFF_ID]: payment.team_member_id || payment.employee_id || "",
+        [TX_SQUARE_DEVICE_ID]: payment.device_details?.device_id || "",
+        [TX_SQUARE_LOCATION_NAME]: "",
+        [TX_SQUARE_DEVICE_NAME]: payment.device_details?.device_name || "",
+        [TX_CARD_BRAND]: cardBrand,
+        [TX_RECEIPT_URL]: payment.receipt_url || "",
+        [TX_IMPORT_STATUS]: { name: IMPORT_STATUS_API_RETRIEVED },
+        [TX_RAW_PAYLOAD]: rawApiResponseText,
+        [TX_WEBHOOK_EVENTS]: [{ id: syncLogRecordId }],
+        [TX_PRIMARY_WEBHOOK_EVENT_ID]: squareEventId,
+        [TX_TRANSACTION_PROCESSED]: true
+    };
+}
+
+function removeNullSelects(fieldsObject) {
+    const cleaned = {};
+
+    for (const [key, value] of Object.entries(fieldsObject)) {
+        if (value !== null) {
+            cleaned[key] = value;
+        }
+    }
+
+    return cleaned;
+}
+
+async function incrementRetryCount(syncLogRecord, errorMessage) {
+    const currentRetryCount = syncLogRecord.getCellValue(SL_RETRY_COUNT) || 0;
+
+    await syncLogTable.updateRecordAsync(syncLogRecord.id, {
+        [SL_PROCESSING_STATUS]: { name: STATUS_FAILED },
+        [SL_AUTOMATION_STEP]: { name: STEP_FAILED },
+        [SL_ERROR_MESSAGE]: errorMessage,
+        [SL_RETRY_COUNT]: currentRetryCount + 1,
+        [SL_LAST_RETRY_AT]: new Date().toISOString(),
+        [SL_RESOLVED]: false
+    });
+}
+
+try {
+    if (!syncLogRecordId) {
+        throw new Error("Missing required input variable: syncLogRecordId.");
+    }
+
+    if (!squareAccessToken) {
+        throw new Error("Missing Airtable secret: SQUARE_SANDBOX_ACCESS_TOKEN.");
+    }
+
+    const syncLogRecord = await syncLogTable.selectRecordAsync(syncLogRecordId);
+
+    if (!syncLogRecord) {
+        throw new Error(`Could not find SYNC LOG record: ${syncLogRecordId}`);
+    }
+
+    const squarePaymentId = getPaymentIdFromSyncLog(syncLogRecord);
+    const squareEventId = getSquareEventIdFromSyncLog(syncLogRecord);
+
+    if (!squarePaymentId) {
+        throw new Error("SYNC LOG.Square Object ID is blank. Cannot retrieve Square payment.");
+    }
+
+    const paymentResponse = await squareGet(`/v2/payments/${encodeURIComponent(squarePaymentId)}`);
+    const payment = paymentResponse.payment;
+
+    if (!payment || !payment.id) {
+        throw new Error("Square Payments API response did not include a payment object.");
+    }
+
+    let orderResponse = null;
+    let order = null;
+
+    if (payment.order_id) {
+        orderResponse = await squareGet(`/v2/orders/${encodeURIComponent(payment.order_id)}`);
+        order = orderResponse.order || null;
+    }
+
+    const combinedApiResponse = {
+        paymentResponse,
+        orderResponse
+    };
+
+    const rawApiResponseText = stringifySafe(combinedApiResponse);
+
+    const existingTransaction = await findTransactionByPaymentId(payment.id);
+
+    const transactionFields = removeNullSelects(buildTransactionFields({
+        payment,
+        order,
+        syncLogRecordId,
+        squareEventId,
+        rawApiResponseText
+    }));
+
+    let transactionRecordId;
+
+    if (existingTransaction) {
+        await transactionsTable.updateRecordAsync(existingTransaction.id, transactionFields);
+        transactionRecordId = existingTransaction.id;
+    } else {
+        transactionRecordId = await transactionsTable.createRecordAsync(transactionFields);
+    }
+
+    await syncLogTable.updateRecordAsync(syncLogRecord.id, {
+        [SL_PROCESSING_STATUS]: { name: STATUS_PROCESSED },
+        [SL_AUTOMATION_STEP]: { name: STEP_PAYMENT_RETRIEVED },
+        [SL_RELATED_TRANSACTION]: [{ id: transactionRecordId }],
+        [SL_RAW_API_RESPONSE]: rawApiResponseText,
+        [SL_ERROR_MESSAGE]: "",
+        [SL_RESOLVED]: true
+    });
+
+    output.set("result", existingTransaction ? "updated_transaction" : "created_transaction");
+    output.set("syncLogRecordId", syncLogRecord.id);
+    output.set("transactionRecordId", transactionRecordId);
+    output.set("squarePaymentId", payment.id);
+    output.set("squareOrderId", payment.order_id || "");
+
+} catch (error) {
+    output.set("result", "failed");
+    output.set("error", error.message);
+
+    if (syncLogRecordId) {
+        const syncLogRecord = await syncLogTable.selectRecordAsync(syncLogRecordId);
+        if (syncLogRecord) {
+            await incrementRetryCount(syncLogRecord, error.message);
+        }
+    }
+
+    throw error;
+}
