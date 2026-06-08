@@ -1,5 +1,5 @@
 /***************************************************************
- * SCRIPT: POS-2-SquareLookup-v26.1.0
+ * SCRIPT: POS-2-SquareLookup-v26.1.1
  * SYSTEM: ADC|IBC POS Backend
  * TABLE(S): SYNC LOG, TRANSACTIONS
  *
@@ -9,13 +9,13 @@
  * creates or updates a processor-agnostic TRANSACTIONS parent record.
  *
  * VERSIONING:
- * POS-2-SquareLookup-v26.1.0
+ * POS-2-SquareLookup-v26.1.1
  *
  * Version format:
  * - POS-2 = major POS workflow/script number.
  * - v26 = 2026 system standard.
  * - .1 = architectural/structural revision.
- * - .0 = first release of this architecture.
+ * - .1 = first bugfix revision of this architecture.
  *
  * SCRIPT BEHAVIOR:
  * 1. Reads the triggering SYNC LOG record ID from automation input.
@@ -33,6 +33,10 @@
  * 12. Does not create TRANSACTION LINES or INVENTORY MOVEMENTS.
  *
  * BUG FIXES / REVISION NOTES:
+ * v26.1.1
+ * - Replaced remoteFetchAsync with fetch for Airtable Automation
+ *   compatibility.
+ *
  * v26.1.0
  * - Updated for processor-agnostic field names.
  * - Replaced Square Payment ID with Processor Payment ID.
@@ -246,7 +250,7 @@ function getTransactionTimestamp(payment) {
 }
 
 async function squareGet(endpoint) {
-    const response = await remoteFetchAsync(`${SQUARE_API_BASE_URL}${endpoint}`, {
+    const response = await fetch(`${SQUARE_API_BASE_URL}${endpoint}`, {
         method: "GET",
         headers: {
             "Authorization": `Bearer ${SQUARE_ACCESS_TOKEN}`,
