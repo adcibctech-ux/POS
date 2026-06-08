@@ -1,5 +1,5 @@
 /***************************************************************
- * SCRIPT: POS-1-Webhook-v26.1.0
+ * SCRIPT: POS-1-Webhook-v26.1.1
  * SYSTEM: ADC|IBC POS Backend
  * TABLE(S): SYNC LOG
  *
@@ -9,13 +9,13 @@
  * SYNC LOG record for each webhook event received.
  *
  * VERSIONING:
- * POS-1-Webhook-v26.1.0
+ * POS-1-Webhook-v26.1.1
  *
  * Version format:
  * - POS-1 = major POS workflow/script number.
  * - v26 = 2026 system standard.
  * - .1 = architectural/structural revision.
- * - .0 = first release of this architecture.
+ * - .1 = first bugfix revision of this architecture.
  *
  * SCRIPT BEHAVIOR:
  * 1. Reads the incoming webhook payload from the Airtable automation
@@ -38,6 +38,10 @@
  * 14. Outputs processing results back to the automation run.
  *
  * BUG FIXES / REVISION NOTES:
+ * v26.1.1
+ * - Removed all writes to Received At because Received At is an
+ *   Airtable Created time field and cannot be modified by script.
+ *
  * v26.1.0
  * - Updated script for processor-agnostic SYNC LOG field names.
  * - Replaced Square Event ID with Processor Event ID.
@@ -47,16 +51,6 @@
  * - Added Processor Object Type mapping.
  * - Preserved duplicate detection by processor event ID.
  * - Preserved Airtable webhook wrapper/body parsing from v26.0.1.
- *
- * v26.0.1
- * - Fixed Airtable webhook wrapper issue.
- * - Added payload normalization so Square event data can be read from
- *   either `payload` or `payload.body`.
- * - Added JSON-string parsing fallback in case Airtable passes body
- *   as a string instead of an object.
- *
- * v26.0.0
- * - Initial POS webhook intake script.
  *
  * REQUIRED AIRTABLE AUTOMATION INPUTS:
  * - payload: Full JSON data object from the Airtable webhook trigger.
@@ -96,7 +90,6 @@ const FIELD_PROCESSING_STATUS = "Processing Status";
 const FIELD_EVENT_TYPE = "Event Type";
 const FIELD_PROCESSOR_OBJECT_TYPE = "Processor Object Type";
 const FIELD_PROCESSOR_OBJECT_ID = "Processor Object ID";
-const FIELD_RECEIVED_AT = "Received At";
 const FIELD_RAW_EVENT_PAYLOAD = "Raw Event Payload";
 const FIELD_ERROR_MESSAGE = "Error Message";
 const FIELD_DUPLICATE_OF = "Duplicate Of";
@@ -261,7 +254,6 @@ async function createFailedLogRecord({
         [FIELD_EVENT_TYPE]: { name: eventType || EVENT_TYPE_UNKNOWN },
         [FIELD_PROCESSOR_OBJECT_TYPE]: { name: objectType || OBJECT_TYPE_UNKNOWN },
         [FIELD_PROCESSOR_OBJECT_ID]: processorObjectId || "",
-        [FIELD_RECEIVED_AT]: new Date().toISOString(),
         [FIELD_RAW_EVENT_PAYLOAD]: rawPayloadText,
         [FIELD_ERROR_MESSAGE]: errorMessage,
         [FIELD_AUTOMATION_STEP]: { name: STEP_FAILED },
@@ -310,7 +302,6 @@ try {
             [FIELD_EVENT_TYPE]: { name: eventType },
             [FIELD_PROCESSOR_OBJECT_TYPE]: { name: processorObjectType },
             [FIELD_PROCESSOR_OBJECT_ID]: processorObjectId || "",
-            [FIELD_RECEIVED_AT]: new Date().toISOString(),
             [FIELD_RAW_EVENT_PAYLOAD]: rawPayloadText,
             [FIELD_ERROR_MESSAGE]: `Duplicate webhook event. Original SYNC LOG record: ${existingMatch.id}`,
             [FIELD_AUTOMATION_STEP]: { name: STEP_DUPLICATE },
@@ -336,7 +327,6 @@ try {
         [FIELD_EVENT_TYPE]: { name: eventType },
         [FIELD_PROCESSOR_OBJECT_TYPE]: { name: processorObjectType },
         [FIELD_PROCESSOR_OBJECT_ID]: processorObjectId || "",
-        [FIELD_RECEIVED_AT]: new Date().toISOString(),
         [FIELD_RAW_EVENT_PAYLOAD]: rawPayloadText,
         [FIELD_AUTOMATION_STEP]: { name: STEP_WEBHOOK_RECEIVED },
         [FIELD_RESOLVED]: false
