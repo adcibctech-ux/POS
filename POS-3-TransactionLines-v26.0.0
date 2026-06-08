@@ -1,0 +1,533 @@
+/***************************************************************
+ * SCRIPT: POS-3-TransactionLines-v26.0.0
+ * SYSTEM: ADC|IBC POS Backend
+ * TABLE(S): TRANSACTIONS, TRANSACTION LINES, ITEM LIBRARY
+ *
+ * PURPOSE:
+ * Creates TRANSACTION LINES records from the Square order payload
+ * stored on a parent TRANSACTIONS record by POS-2.
+ *
+ * VERSIONING:
+ * POS-3-TransactionLines-v26.0.0
+ *
+ * Version format:
+ * - POS-3 = major POS workflow/script number.
+ * - v26 = 2026 system standard.
+ * - .0 = first POS-3 logic release.
+ * - .0 = first drop-in script release of this POS-3 workflow.
+ *
+ * SCRIPT BEHAVIOR:
+ * 1. Reads the triggering TRANSACTIONS record ID from automation input.
+ * 2. Reads TRANSACTIONS → Raw Payload.
+ * 3. Parses the stored Square payment/order payload.
+ * 4. Reads Square order.line_items.
+ * 5. Creates one TRANSACTION LINES record per Square line item.
+ * 6. Uses SKU-first matching against ITEM LIBRARY.
+ * 7. Matching priority:
+ *    a. SKU
+ *    b. Barcode Value
+ *    c. Processor Variation ID
+ *    d. Processor Catalog Object ID
+ * 8. For custom amount lines:
+ *    - Is Custom Amount? = checked
+ *    - Matched Item = blank
+ *    - Line Status = Needs Review
+ *    - Fulfillment Status = Not Required
+ *    - Itemization Type = Custom Amount
+ * 9. For matched catalog lines:
+ *    - Matched Item = linked ITEM LIBRARY record
+ *    - Line Status = Matched
+ *    - Fulfillment Status = Not Required
+ *    - Itemization Type = Catalog Item
+ * 10. For unmatched catalog lines:
+ *    - Matched Item = blank
+ *    - Line Status = Needs Review
+ *    - Fulfillment Status = Not Required
+ *    - Itemization Type = Catalog Item
+ * 11. Updates TRANSACTIONS → Lines Created? = checked after line creation.
+ * 12. Does not create inventory movements.
+ *
+ * BUG FIXES / REVISION NOTES:
+ * v26.0.0
+ * - Initial POS-3 release.
+ * - Uses processor-agnostic field names.
+ * - Uses SKU-first item matching.
+ * - Does not write to computed/formula fields:
+ *   Line Net, Inventory Eligible?, Return Eligible?,
+ *   Matched Item - Inventory Item?
+ *
+ * REQUIRED AIRTABLE AUTOMATION INPUTS:
+ * - transactionRecordId: Record ID of the triggering TRANSACTIONS record.
+ *
+ * REQUIRED TABLES:
+ * - TRANSACTIONS
+ * - TRANSACTION LINES
+ * - ITEM LIBRARY
+ ***************************************************************/
+
+const config = input.config();
+
+const transactionRecordId = config.transactionRecordId;
+
+const TRANSACTIONS_TABLE = "TRANSACTIONS";
+const TRANSACTION_LINES_TABLE = "TRANSACTION LINES";
+const ITEM_LIBRARY_TABLE = "ITEM LIBRARY";
+
+// TRANSACTIONS fields
+const TX_PROCESSOR_PAYMENT_ID = "Processor Payment ID";
+const TX_PROCESSOR_ORDER_ID = "Processor Order ID";
+const TX_TRANSACTION_TIMESTAMP = "Transaction Timestamp";
+const TX_LINES_CREATED = "Lines Created?";
+const TX_RAW_PAYLOAD = "Raw Payload";
+const TX_NOTES = "Notes";
+
+// TRANSACTION LINES fields
+const TL_LINE_STATUS = "Line Status";
+const TL_FULFILLMENT_STATUS = "Fulfillment Status";
+const TL_TRANSACTION = "Transaction";
+const TL_LINE_ITEM_NAME = "Line Item Name";
+const TL_VARIATION_NAME = "Variation Name";
+const TL_SKU = "SKU";
+const TL_BARCODE_VALUE = "Barcode Value";
+const TL_MATCHED_ITEM = "Matched Item";
+const TL_QUANTITY = "Quantity";
+const TL_QUANTITY_RESERVED = "Quantity Reserved";
+const TL_QUANTITY_FULFILLED = "Quantity Fulfilled";
+const TL_QUANTITY_REFUNDED_RETURNED = "Quantity Refunded/Returned";
+const TL_UNIT_PRICE = "Unit Price";
+const TL_LINE_GROSS = "Line Gross";
+const TL_LINE_TAX = "Line Tax";
+const TL_LINE_DISCOUNT = "Line Discount";
+const TL_LINE_REFUND_AMOUNT = "Line Refund Amount";
+const TL_IS_CUSTOM_AMOUNT = "Is Custom Amount?";
+const TL_LINE_NOTE = "Line Note";
+const TL_PROCESSOR_LINE_ITEM_ID = "Processor Line Item ID";
+const TL_PROCESSOR_CATALOG_OBJECT_ID = "Processor Catalog Object ID";
+const TL_ITEMIZATION_TYPE = "Itemization Type";
+const TL_LINE_RAW_PAYLOAD = "Line Raw Payload";
+const TL_INVENTORY_MOVEMENT_CREATED = "Inventory Movement Created?";
+
+// ITEM LIBRARY fields
+const ITEM_SKU = "SKU";
+const ITEM_BARCODE_VALUE = "Barcode Value";
+const ITEM_PROCESSOR_VARIATION_ID = "Processor Variation ID";
+const ITEM_PROCESSOR_CATALOG_OBJECT_ID = "Processor Catalog Object ID";
+const ITEM_ACTIVE = "Active?";
+
+// Select values
+const LINE_STATUS_MATCHED = "Matched";
+const LINE_STATUS_NEEDS_REVIEW = "Needs Review";
+const LINE_STATUS_FAILED = "Failed";
+
+const FULFILLMENT_STATUS_NOT_REQUIRED = "Not Required";
+
+const ITEMIZATION_TYPE_CATALOG_ITEM = "Catalog Item";
+const ITEMIZATION_TYPE_CUSTOM_AMOUNT = "Custom Amount";
+
+const transactionsTable = base.getTable(TRANSACTIONS_TABLE);
+const transactionLinesTable = base.getTable(TRANSACTION_LINES_TABLE);
+const itemLibraryTable = base.getTable(ITEM_LIBRARY_TABLE);
+
+function stringifySafe(value) {
+    try {
+        return JSON.stringify(value, null, 2);
+    } catch (error) {
+        return String(value);
+    }
+}
+
+function parseJsonSafe(value, label) {
+    if (!value) {
+        throw new Error(`${label} is empty.`);
+    }
+
+    if (typeof value !== "string") {
+        return value;
+    }
+
+    try {
+        return JSON.parse(value);
+    } catch (error) {
+        throw new Error(`${label} could not be parsed as JSON. ${error.message}`);
+    }
+}
+
+function selectValue(name) {
+    return { name };
+}
+
+function moneyToDollars(moneyObject) {
+    if (!moneyObject || typeof moneyObject.amount !== "number") {
+        return 0;
+    }
+
+    return moneyObject.amount / 100;
+}
+
+function normalizeKey(value) {
+    if (!value) {
+        return "";
+    }
+
+    return String(value).trim().toUpperCase();
+}
+
+function parseQuantity(quantityValue) {
+    if (quantityValue === null || quantityValue === undefined || quantityValue === "") {
+        return 0;
+    }
+
+    const parsed = Number(quantityValue);
+
+    if (Number.isNaN(parsed)) {
+        return 0;
+    }
+
+    return parsed;
+}
+
+function getLineItemName(lineItem) {
+    return (
+        lineItem?.name ||
+        lineItem?.note ||
+        "Unnamed Line Item"
+    );
+}
+
+function getLineVariationName(lineItem) {
+    return (
+        lineItem?.variation_name ||
+        ""
+    );
+}
+
+function getLineSKU(lineItem) {
+    return (
+        lineItem?.variation_sku ||
+        lineItem?.sku ||
+        lineItem?.metadata?.sku ||
+        ""
+    );
+}
+
+function getLineBarcodeValue(lineItem) {
+    return (
+        lineItem?.metadata?.barcode ||
+        lineItem?.metadata?.barcode_value ||
+        ""
+    );
+}
+
+function getLineProcessorCatalogObjectId(lineItem) {
+    return (
+        lineItem?.catalog_object_id ||
+        ""
+    );
+}
+
+function getLineProcessorLineItemId(lineItem, index) {
+    return (
+        lineItem?.uid ||
+        lineItem?.id ||
+        `line_${index + 1}`
+    );
+}
+
+function isCustomAmountLine(lineItem) {
+    return (
+        lineItem?.item_type === "CUSTOM_AMOUNT" ||
+        !lineItem?.catalog_object_id
+    );
+}
+
+function getLineItemizationType(lineItem) {
+    if (isCustomAmountLine(lineItem)) {
+        return ITEMIZATION_TYPE_CUSTOM_AMOUNT;
+    }
+
+    return ITEMIZATION_TYPE_CATALOG_ITEM;
+}
+
+function getLineUnitPrice(lineItem) {
+    return moneyToDollars(
+        lineItem?.base_price_money ||
+        lineItem?.variation_total_price_money
+    );
+}
+
+function getLineGross(lineItem) {
+    return moneyToDollars(
+        lineItem?.gross_sales_money ||
+        lineItem?.total_money ||
+        lineItem?.variation_total_price_money
+    );
+}
+
+function getLineTax(lineItem) {
+    return moneyToDollars(lineItem?.total_tax_money);
+}
+
+function getLineDiscount(lineItem) {
+    return moneyToDollars(lineItem?.total_discount_money);
+}
+
+function buildItemIndexes(itemRecords) {
+    const bySku = new Map();
+    const byBarcode = new Map();
+    const byProcessorVariationId = new Map();
+    const byProcessorCatalogObjectId = new Map();
+
+    for (const itemRecord of itemRecords) {
+        const isActive = itemRecord.getCellValue(ITEM_ACTIVE);
+
+        if (isActive === false) {
+            continue;
+        }
+
+        const sku = normalizeKey(itemRecord.getCellValueAsString(ITEM_SKU));
+        const barcode = normalizeKey(itemRecord.getCellValueAsString(ITEM_BARCODE_VALUE));
+        const processorVariationId = normalizeKey(itemRecord.getCellValueAsString(ITEM_PROCESSOR_VARIATION_ID));
+        const processorCatalogObjectId = normalizeKey(itemRecord.getCellValueAsString(ITEM_PROCESSOR_CATALOG_OBJECT_ID));
+
+        if (sku && !bySku.has(sku)) {
+            bySku.set(sku, itemRecord);
+        }
+
+        if (barcode && !byBarcode.has(barcode)) {
+            byBarcode.set(barcode, itemRecord);
+        }
+
+        if (processorVariationId && !byProcessorVariationId.has(processorVariationId)) {
+            byProcessorVariationId.set(processorVariationId, itemRecord);
+        }
+
+        if (processorCatalogObjectId && !byProcessorCatalogObjectId.has(processorCatalogObjectId)) {
+            byProcessorCatalogObjectId.set(processorCatalogObjectId, itemRecord);
+        }
+    }
+
+    return {
+        bySku,
+        byBarcode,
+        byProcessorVariationId,
+        byProcessorCatalogObjectId
+    };
+}
+
+function matchItemForLine(lineItem, itemIndexes) {
+    const sku = normalizeKey(getLineSKU(lineItem));
+    const barcodeValue = normalizeKey(getLineBarcodeValue(lineItem));
+    const processorCatalogObjectId = normalizeKey(getLineProcessorCatalogObjectId(lineItem));
+
+    if (sku && itemIndexes.bySku.has(sku)) {
+        return {
+            itemRecord: itemIndexes.bySku.get(sku),
+            matchMethod: "SKU"
+        };
+    }
+
+    if (barcodeValue && itemIndexes.byBarcode.has(barcodeValue)) {
+        return {
+            itemRecord: itemIndexes.byBarcode.get(barcodeValue),
+            matchMethod: "Barcode Value"
+        };
+    }
+
+    if (processorCatalogObjectId && itemIndexes.byProcessorVariationId.has(processorCatalogObjectId)) {
+        return {
+            itemRecord: itemIndexes.byProcessorVariationId.get(processorCatalogObjectId),
+            matchMethod: "Processor Variation ID"
+        };
+    }
+
+    if (processorCatalogObjectId && itemIndexes.byProcessorCatalogObjectId.has(processorCatalogObjectId)) {
+        return {
+            itemRecord: itemIndexes.byProcessorCatalogObjectId.get(processorCatalogObjectId),
+            matchMethod: "Processor Catalog Object ID"
+        };
+    }
+
+    return {
+        itemRecord: null,
+        matchMethod: ""
+    };
+}
+
+async function getTransactionRecord(recordId) {
+    const query = await transactionsTable.selectRecordsAsync({
+        fields: [
+            TX_PROCESSOR_PAYMENT_ID,
+            TX_PROCESSOR_ORDER_ID,
+            TX_TRANSACTION_TIMESTAMP,
+            TX_LINES_CREATED,
+            TX_RAW_PAYLOAD,
+            TX_NOTES
+        ]
+    });
+
+    return query.getRecord(recordId);
+}
+
+async function getItemRecords() {
+    const query = await itemLibraryTable.selectRecordsAsync({
+        fields: [
+            ITEM_SKU,
+            ITEM_BARCODE_VALUE,
+            ITEM_PROCESSOR_VARIATION_ID,
+            ITEM_PROCESSOR_CATALOG_OBJECT_ID,
+            ITEM_ACTIVE
+        ]
+    });
+
+    return query.records;
+}
+
+function buildTransactionLineRecord({
+    transactionRecordId,
+    lineItem,
+    index,
+    matchedItemRecord,
+    matchMethod
+}) {
+    const isCustom = isCustomAmountLine(lineItem);
+    const lineItemName = getLineItemName(lineItem);
+    const variationName = getLineVariationName(lineItem);
+    const sku = getLineSKU(lineItem);
+    const barcodeValue = getLineBarcodeValue(lineItem);
+    const quantity = parseQuantity(lineItem?.quantity);
+    const processorLineItemId = getLineProcessorLineItemId(lineItem, index);
+    const processorCatalogObjectId = getLineProcessorCatalogObjectId(lineItem);
+    const itemizationType = getLineItemizationType(lineItem);
+
+    let lineStatus;
+    let lineNote;
+
+    if (isCustom) {
+        lineStatus = LINE_STATUS_NEEDS_REVIEW;
+        lineNote = "Custom amount line from Square; no item match attempted.";
+    } else if (matchedItemRecord) {
+        lineStatus = LINE_STATUS_MATCHED;
+        lineNote = matchMethod ? `Matched by ${matchMethod}.` : "Matched to item.";
+    } else {
+        lineStatus = LINE_STATUS_NEEDS_REVIEW;
+        lineNote = "No matching ITEM LIBRARY record found using SKU, Barcode Value, Processor Variation ID, or Processor Catalog Object ID.";
+    }
+
+    const fields = {
+        [TL_LINE_STATUS]: selectValue(lineStatus),
+        [TL_FULFILLMENT_STATUS]: selectValue(FULFILLMENT_STATUS_NOT_REQUIRED),
+        [TL_TRANSACTION]: [{ id: transactionRecordId }],
+        [TL_LINE_ITEM_NAME]: lineItemName,
+        [TL_VARIATION_NAME]: variationName,
+        [TL_SKU]: sku,
+        [TL_BARCODE_VALUE]: barcodeValue,
+        [TL_QUANTITY]: quantity,
+        [TL_QUANTITY_RESERVED]: 0,
+        [TL_QUANTITY_FULFILLED]: 0,
+        [TL_QUANTITY_REFUNDED_RETURNED]: 0,
+        [TL_UNIT_PRICE]: getLineUnitPrice(lineItem),
+        [TL_LINE_GROSS]: getLineGross(lineItem),
+        [TL_LINE_TAX]: getLineTax(lineItem),
+        [TL_LINE_DISCOUNT]: getLineDiscount(lineItem),
+        [TL_LINE_REFUND_AMOUNT]: 0,
+        [TL_IS_CUSTOM_AMOUNT]: isCustom,
+        [TL_LINE_NOTE]: lineNote,
+        [TL_PROCESSOR_LINE_ITEM_ID]: processorLineItemId,
+        [TL_PROCESSOR_CATALOG_OBJECT_ID]: processorCatalogObjectId,
+        [TL_ITEMIZATION_TYPE]: selectValue(itemizationType),
+        [TL_LINE_RAW_PAYLOAD]: stringifySafe(lineItem),
+        [TL_INVENTORY_MOVEMENT_CREATED]: false
+    };
+
+    if (matchedItemRecord && !isCustom) {
+        fields[TL_MATCHED_ITEM] = [{ id: matchedItemRecord.id }];
+    }
+
+    return {
+        fields
+    };
+}
+
+async function createRecordsInBatches(table, records, batchSize = 50) {
+    const createdRecordIds = [];
+
+    for (let i = 0; i < records.length; i += batchSize) {
+        const batch = records.slice(i, i + batchSize);
+        const createdRecords = await table.createRecordsAsync(batch);
+
+        for (const createdRecordId of createdRecords) {
+            createdRecordIds.push(createdRecordId);
+        }
+    }
+
+    return createdRecordIds;
+}
+
+async function main() {
+    if (!transactionRecordId) {
+        throw new Error("Missing required automation input: transactionRecordId.");
+    }
+
+    const transactionRecord = await getTransactionRecord(transactionRecordId);
+
+    if (!transactionRecord) {
+        throw new Error(`Could not find TRANSACTIONS record: ${transactionRecordId}`);
+    }
+
+    const linesAlreadyCreated = transactionRecord.getCellValue(TX_LINES_CREATED);
+
+    if (linesAlreadyCreated) {
+        output.set("result", "skipped_lines_already_created");
+        output.set("transactionRecordId", transactionRecordId);
+        return;
+    }
+
+    const rawPayloadText = transactionRecord.getCellValueAsString(TX_RAW_PAYLOAD);
+    const rawPayload = parseJsonSafe(rawPayloadText, "TRANSACTIONS Raw Payload");
+
+    const order = rawPayload?.order || rawPayload?.orderResponse?.order || null;
+
+    if (!order) {
+        throw new Error("TRANSACTIONS Raw Payload does not contain an order object.");
+    }
+
+    const lineItems = order?.line_items || [];
+
+    if (!Array.isArray(lineItems) || lineItems.length === 0) {
+        throw new Error("Square order does not contain any line_items.");
+    }
+
+    const itemRecords = await getItemRecords();
+    const itemIndexes = buildItemIndexes(itemRecords);
+
+    const transactionLineRecords = lineItems.map((lineItem, index) => {
+        const isCustom = isCustomAmountLine(lineItem);
+        const matchResult = isCustom
+            ? { itemRecord: null, matchMethod: "" }
+            : matchItemForLine(lineItem, itemIndexes);
+
+        return buildTransactionLineRecord({
+            transactionRecordId,
+            lineItem,
+            index,
+            matchedItemRecord: matchResult.itemRecord,
+            matchMethod: matchResult.matchMethod
+        });
+    });
+
+    const createdLineRecordIds = await createRecordsInBatches(
+        transactionLinesTable,
+        transactionLineRecords
+    );
+
+    await transactionsTable.updateRecordAsync(transactionRecordId, {
+        [TX_LINES_CREATED]: true
+    });
+
+    output.set("result", "created_transaction_lines");
+    output.set("transactionRecordId", transactionRecordId);
+    output.set("createdLineCount", createdLineRecordIds.length);
+    output.set("createdLineRecordIds", createdLineRecordIds);
+}
+
+await main();
