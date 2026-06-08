@@ -1,5 +1,5 @@
 /***************************************************************
- * SCRIPT: POS-2-SquareLookup-v26.1.1
+ * SCRIPT: POS-2-SquareLookup-v26.1.2
  * SYSTEM: ADC|IBC POS Backend
  * TABLE(S): SYNC LOG, TRANSACTIONS
  *
@@ -9,13 +9,13 @@
  * creates or updates a processor-agnostic TRANSACTIONS parent record.
  *
  * VERSIONING:
- * POS-2-SquareLookup-v26.1.1
+ * POS-2-SquareLookup-v26.1.2
  *
  * Version format:
  * - POS-2 = major POS workflow/script number.
  * - v26 = 2026 system standard.
  * - .1 = architectural/structural revision.
- * - .1 = first bugfix revision of this architecture.
+ * - .2 = second bugfix revision of this architecture.
  *
  * SCRIPT BEHAVIOR:
  * 1. Reads the triggering SYNC LOG record ID from automation input.
@@ -33,6 +33,11 @@
  * 12. Does not create TRANSACTION LINES or INVENTORY MOVEMENTS.
  *
  * BUG FIXES / REVISION NOTES:
+ * v26.1.2
+ * - Fixed Exception Type write format.
+ * - Exception Type is a multiple select field, so the script now writes
+ *   [{ name: "None" }] instead of an empty string.
+ *
  * v26.1.1
  * - Replaced remoteFetchAsync with fetch for Airtable Automation
  *   compatibility.
@@ -151,6 +156,7 @@ const REFUND_STATUS_NONE = "None";
 const REFUND_STATUS_PARTIAL = "Partial Refund";
 const REFUND_STATUS_FULL = "Full Refund";
 const IMPORT_STATUS_API_RETRIEVED = "API Retrieved";
+const EXCEPTION_TYPE_NONE = "None";
 
 const syncLogTable = base.getTable(SYNC_LOG_TABLE);
 const transactionsTable = base.getTable(TRANSACTIONS_TABLE);
@@ -177,6 +183,12 @@ function selectValue(name) {
     }
 
     return { name };
+}
+
+function multiSelectValues(names) {
+    return names
+        .filter(Boolean)
+        .map(name => ({ name }));
 }
 
 function normalizeSquarePaymentType(payment) {
@@ -366,7 +378,7 @@ function buildTransactionFields({
         [TX_CARD_BRAND]: getCardBrand(payment),
         [TX_RECEIPT_URL]: payment.receipt_url || "",
         [TX_IMPORT_STATUS]: selectValue(IMPORT_STATUS_API_RETRIEVED),
-        [TX_EXCEPTION_TYPE]: "",
+        [TX_EXCEPTION_TYPE]: multiSelectValues([EXCEPTION_TYPE_NONE]),
         [TX_TRANSACTION_PROCESSED]: true,
         [TX_WEBHOOK_EVENTS]: webhookLinks,
         [TX_PRIMARY_PROCESSOR_EVENT_ID]: primaryProcessorEventId,
