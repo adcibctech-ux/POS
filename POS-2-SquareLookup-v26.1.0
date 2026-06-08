@@ -1,0 +1,510 @@
+/***************************************************************
+ * SCRIPT: POS-2-SquareLookup-v26.1.0
+ * SYSTEM: ADC|IBC POS Backend
+ * TABLE(S): SYNC LOG, TRANSACTIONS
+ *
+ * PURPOSE:
+ * Processes Square payment webhook events already logged by POS-1,
+ * retrieves payment/order details from the Square Sandbox API, and
+ * creates or updates a processor-agnostic TRANSACTIONS parent record.
+ *
+ * VERSIONING:
+ * POS-2-SquareLookup-v26.1.0
+ *
+ * Version format:
+ * - POS-2 = major POS workflow/script number.
+ * - v26 = 2026 system standard.
+ * - .1 = architectural/structural revision.
+ * - .0 = first release of this architecture.
+ *
+ * SCRIPT BEHAVIOR:
+ * 1. Reads the triggering SYNC LOG record ID from automation input.
+ * 2. Verifies the SYNC LOG record is a Square Payment event.
+ * 3. Retrieves the Square payment by Processor Object ID.
+ * 4. Retrieves the Square order when the payment has an order_id.
+ * 5. Finds an existing TRANSACTIONS record by Processor Payment ID.
+ * 6. Creates a new TRANSACTIONS record if no match exists.
+ * 7. Updates the existing TRANSACTIONS record if a match exists.
+ * 8. Links the triggering SYNC LOG record to the TRANSACTIONS record.
+ * 9. Writes Primary Processor Event ID on new transactions using the
+ *    triggering SYNC LOG Processor Event ID.
+ * 10. Preserves Primary Processor Event ID on existing transactions.
+ * 11. Marks the SYNC LOG record as Processed.
+ * 12. Does not create TRANSACTION LINES or INVENTORY MOVEMENTS.
+ *
+ * BUG FIXES / REVISION NOTES:
+ * v26.1.0
+ * - Updated for processor-agnostic field names.
+ * - Replaced Square Payment ID with Processor Payment ID.
+ * - Replaced Square Order ID with Processor Order ID.
+ * - Replaced Square Transaction ID with Processor Transaction ID.
+ * - Replaced Square Location/Staff/Device fields with Processor fields.
+ * - Reads Processor Object ID from SYNC LOG.
+ * - Requires Processor Object Type = Payment.
+ * - Writes Payment Processor = Square.
+ * - Preserves Webhook Events linking.
+ * - Writes Primary Processor Event ID from the triggering SYNC LOG event
+ *   when creating a new TRANSACTIONS record.
+ * - Preserves existing Primary Processor Event ID when updating an
+ *   existing TRANSACTIONS record.
+ * - Does not write to computed fields such as All Webhook Event IDs.
+ *
+ * REQUIRED AIRTABLE AUTOMATION INPUTS:
+ * - syncLogRecordId: Record ID of the triggering SYNC LOG record.
+ *
+ * REQUIRED AIRTABLE SECRETS:
+ * - SQUARE_SANDBOX_ACCESS_TOKEN
+ *
+ * REQUIRED TABLES:
+ * - SYNC LOG
+ * - TRANSACTIONS
+ ***************************************************************/
+
+const config = input.config();
+
+const syncLogRecordId = config.syncLogRecordId;
+
+const SQUARE_ACCESS_TOKEN = input.secret("SQUARE_SANDBOX_ACCESS_TOKEN");
+const SQUARE_API_BASE_URL = "https://connect.squareupsandbox.com";
+const SQUARE_VERSION = "2026-05-20";
+
+const SYNC_LOG_TABLE = "SYNC LOG";
+const TRANSACTIONS_TABLE = "TRANSACTIONS";
+
+// SYNC LOG fields
+const SL_PROCESSOR_EVENT_ID = "Processor Event ID";
+const SL_PAYMENT_PROCESSOR = "Payment Processor";
+const SL_PROCESSING_STATUS = "Processing Status";
+const SL_EVENT_TYPE = "Event Type";
+const SL_PROCESSOR_OBJECT_TYPE = "Processor Object Type";
+const SL_PROCESSOR_OBJECT_ID = "Processor Object ID";
+const SL_RELATED_TRANSACTION = "Related Transaction";
+const SL_RAW_API_RESPONSE = "Raw API Response";
+const SL_ERROR_MESSAGE = "Error Message";
+const SL_RESOLVED = "Resolved?";
+const SL_RESOLVED_NOTES = "Resolved Notes";
+const SL_AUTOMATION_STEP = "Automation Step";
+
+// TRANSACTIONS fields
+const TX_PROCESSOR_PAYMENT_ID = "Processor Payment ID";
+const TX_PROCESSOR_TRANSACTION_ID = "Processor Transaction ID";
+const TX_PROCESSOR_ORDER_ID = "Processor Order ID";
+const TX_PAYMENT_PROCESSOR = "Payment Processor";
+const TX_SALES_CHANNEL = "Sales Channel";
+const TX_ORDER_TYPE = "Order Type";
+const TX_TRANSACTION_TIMESTAMP = "Transaction Timestamp";
+const TX_PAYMENT_STATUS = "Payment Status";
+const TX_PAYMENT_TYPE = "Payment Type";
+const TX_REFUND_STATUS = "Refund Status";
+const TX_FULFILLMENT_STATUS = "Fulfillment Status";
+const TX_GROSS_SALE = "Gross Sale";
+const TX_TAX_TOTAL = "Tax Total";
+const TX_DISCOUNT_TOTAL = "Discount Total";
+const TX_REFUND_TOTAL = "Refund Total";
+const TX_PROCESSING_FEE = "Processing Fee";
+const TX_NET_TOTAL = "Net Total";
+const TX_PROCESSOR_LOCATION_ID = "Processor Location ID";
+const TX_PROCESSOR_LOCATION_NAME = "Processor Location Name";
+const TX_PROCESSOR_STAFF_ID = "Processor Staff ID";
+const TX_PROCESSOR_DEVICE_ID = "Processor Device ID";
+const TX_PROCESSOR_DEVICE_NAME = "Processor Device Name";
+const TX_CARD_BRAND = "Card Brand";
+const TX_RECEIPT_URL = "Receipt URL";
+const TX_CUSTOMER_NAME = "Customer Name";
+const TX_CUSTOMER_EMAIL = "Customer Email";
+const TX_CUSTOMER_PHONE = "Customer Phone";
+const TX_SHIPPING_ADDRESS = "Shipping Address";
+const TX_SHIPPING_METHOD = "Shipping Method";
+const TX_TRACKING_NUMBER = "Tracking Number";
+const TX_FULFILLMENT_NOTES = "Fulfillment Notes";
+const TX_IMPORT_STATUS = "Import Status";
+const TX_EXCEPTION_TYPE = "Exception Type";
+const TX_TRANSACTION_PROCESSED = "Transaction Processed?";
+const TX_LINES_CREATED = "Lines Created?";
+const TX_INVENTORY_MOVEMENTS_CREATED = "Inventory Movements Created?";
+const TX_WEBHOOK_EVENTS = "Webhook Events";
+const TX_PRIMARY_PROCESSOR_EVENT_ID = "Primary Processor Event ID";
+const TX_RAW_PAYLOAD = "Raw Payload";
+const TX_NOTES = "Notes";
+
+// Select values
+const PROCESSOR_SQUARE = "Square";
+
+const STATUS_RECEIVED = "Received";
+const STATUS_PROCESSED = "Processed";
+const STATUS_FAILED = "Failed";
+const STATUS_NEEDS_REVIEW = "Needs Review";
+
+const STEP_PAYMENT_RETRIEVED = "Payment Retrieved";
+const STEP_FAILED = "Failed";
+
+const OBJECT_TYPE_PAYMENT = "Payment";
+
+const SALES_CHANNEL_IN_PERSON = "In-Person POS";
+const ORDER_TYPE_IN_PERSON = "In-Person";
+const FULFILLMENT_STATUS_NOT_REQUIRED = "Not Required";
+const REFUND_STATUS_NONE = "None";
+const REFUND_STATUS_PARTIAL = "Partial Refund";
+const REFUND_STATUS_FULL = "Full Refund";
+const IMPORT_STATUS_API_RETRIEVED = "API Retrieved";
+
+const syncLogTable = base.getTable(SYNC_LOG_TABLE);
+const transactionsTable = base.getTable(TRANSACTIONS_TABLE);
+
+function moneyToDollars(moneyObject) {
+    if (!moneyObject || typeof moneyObject.amount !== "number") {
+        return 0;
+    }
+
+    return moneyObject.amount / 100;
+}
+
+function stringifySafe(value) {
+    try {
+        return JSON.stringify(value, null, 2);
+    } catch (error) {
+        return String(value);
+    }
+}
+
+function selectValue(name) {
+    if (!name) {
+        return undefined;
+    }
+
+    return { name };
+}
+
+function normalizeSquarePaymentType(payment) {
+    return (
+        payment?.source_type ||
+        "OTHER"
+    );
+}
+
+function getCardBrand(payment) {
+    return (
+        payment?.card_details?.card?.card_brand ||
+        ""
+    );
+}
+
+function getProcessingFeeTotal(payment) {
+    const fees = payment?.processing_fee || [];
+
+    return fees.reduce((sum, fee) => {
+        return sum + moneyToDollars(fee?.amount_money);
+    }, 0);
+}
+
+function getRefundTotal(payment) {
+    return moneyToDollars(payment?.refunded_money);
+}
+
+function getRefundStatus(grossSale, refundTotal) {
+    if (!refundTotal || refundTotal <= 0) {
+        return REFUND_STATUS_NONE;
+    }
+
+    if (refundTotal >= grossSale) {
+        return REFUND_STATUS_FULL;
+    }
+
+    return REFUND_STATUS_PARTIAL;
+}
+
+function getOrderTaxTotal(order) {
+    return moneyToDollars(order?.total_tax_money);
+}
+
+function getOrderDiscountTotal(order) {
+    return moneyToDollars(order?.total_discount_money);
+}
+
+function getProcessorDeviceId(payment) {
+    return (
+        payment?.device_details?.device_id ||
+        payment?.device_details?.square_product ||
+        ""
+    );
+}
+
+function getProcessorDeviceName(payment) {
+    return (
+        payment?.device_details?.device_name ||
+        payment?.device_details?.square_product ||
+        ""
+    );
+}
+
+function getTransactionTimestamp(payment) {
+    return (
+        payment?.created_at ||
+        payment?.updated_at ||
+        new Date().toISOString()
+    );
+}
+
+async function squareGet(endpoint) {
+    const response = await remoteFetchAsync(`${SQUARE_API_BASE_URL}${endpoint}`, {
+        method: "GET",
+        headers: {
+            "Authorization": `Bearer ${SQUARE_ACCESS_TOKEN}`,
+            "Square-Version": SQUARE_VERSION,
+            "Content-Type": "application/json"
+        }
+    });
+
+    const responseText = await response.text();
+
+    let responseJson;
+    try {
+        responseJson = JSON.parse(responseText);
+    } catch (error) {
+        responseJson = { raw: responseText };
+    }
+
+    if (!response.ok) {
+        throw new Error(
+            `Square API request failed for ${endpoint}. Status ${response.status}: ${stringifySafe(responseJson)}`
+        );
+    }
+
+    return responseJson;
+}
+
+async function getSyncLogRecord(recordId) {
+    const query = await syncLogTable.selectRecordsAsync({
+        fields: [
+            SL_PROCESSOR_EVENT_ID,
+            SL_PAYMENT_PROCESSOR,
+            SL_PROCESSING_STATUS,
+            SL_EVENT_TYPE,
+            SL_PROCESSOR_OBJECT_TYPE,
+            SL_PROCESSOR_OBJECT_ID
+        ]
+    });
+
+    return query.getRecord(recordId);
+}
+
+async function findTransactionByProcessorPaymentId(processorPaymentId) {
+    const query = await transactionsTable.selectRecordsAsync({
+        fields: [
+            TX_PROCESSOR_PAYMENT_ID,
+            TX_WEBHOOK_EVENTS,
+            TX_PRIMARY_PROCESSOR_EVENT_ID
+        ]
+    });
+
+    return query.records.find(record => {
+        return record.getCellValueAsString(TX_PROCESSOR_PAYMENT_ID) === processorPaymentId;
+    }) || null;
+}
+
+function getExistingLinkedRecordIds(record, fieldName) {
+    const linkedRecords = record?.getCellValue(fieldName) || [];
+    return linkedRecords.map(linkedRecord => linkedRecord.id);
+}
+
+function uniqueLinkedRecordIds(ids) {
+    return [...new Set(ids.filter(Boolean))].map(id => ({ id }));
+}
+
+function buildTransactionFields({
+    payment,
+    order,
+    syncLogRecordId,
+    processorEventId,
+    existingTransactionRecord
+}) {
+    const processorPaymentId = payment.id;
+    const processorOrderId = payment.order_id || order?.id || "";
+    const processorTransactionId = payment.id;
+
+    const grossSale = moneyToDollars(payment.amount_money);
+    const taxTotal = getOrderTaxTotal(order);
+    const discountTotal = getOrderDiscountTotal(order);
+    const refundTotal = getRefundTotal(payment);
+    const processingFee = getProcessingFeeTotal(payment);
+    const netTotal = grossSale - refundTotal - processingFee;
+
+    const existingWebhookIds = getExistingLinkedRecordIds(existingTransactionRecord, TX_WEBHOOK_EVENTS);
+    const webhookLinks = uniqueLinkedRecordIds([...existingWebhookIds, syncLogRecordId]);
+
+    const primaryProcessorEventId =
+        existingTransactionRecord?.getCellValueAsString(TX_PRIMARY_PROCESSOR_EVENT_ID) ||
+        processorEventId;
+
+    const fields = {
+        [TX_PROCESSOR_PAYMENT_ID]: processorPaymentId,
+        [TX_PROCESSOR_TRANSACTION_ID]: processorTransactionId,
+        [TX_PROCESSOR_ORDER_ID]: processorOrderId,
+        [TX_PAYMENT_PROCESSOR]: selectValue(PROCESSOR_SQUARE),
+        [TX_SALES_CHANNEL]: selectValue(SALES_CHANNEL_IN_PERSON),
+        [TX_ORDER_TYPE]: selectValue(ORDER_TYPE_IN_PERSON),
+        [TX_TRANSACTION_TIMESTAMP]: getTransactionTimestamp(payment),
+        [TX_PAYMENT_STATUS]: selectValue(payment.status || STATUS_NEEDS_REVIEW),
+        [TX_PAYMENT_TYPE]: selectValue(normalizeSquarePaymentType(payment)),
+        [TX_REFUND_STATUS]: selectValue(getRefundStatus(grossSale, refundTotal)),
+        [TX_FULFILLMENT_STATUS]: selectValue(FULFILLMENT_STATUS_NOT_REQUIRED),
+        [TX_GROSS_SALE]: grossSale,
+        [TX_TAX_TOTAL]: taxTotal,
+        [TX_DISCOUNT_TOTAL]: discountTotal,
+        [TX_REFUND_TOTAL]: refundTotal,
+        [TX_PROCESSING_FEE]: processingFee,
+        [TX_NET_TOTAL]: netTotal,
+        [TX_PROCESSOR_LOCATION_ID]: payment.location_id || "",
+        [TX_PROCESSOR_LOCATION_NAME]: "",
+        [TX_PROCESSOR_STAFF_ID]: payment.team_member_id || "",
+        [TX_PROCESSOR_DEVICE_ID]: getProcessorDeviceId(payment),
+        [TX_PROCESSOR_DEVICE_NAME]: getProcessorDeviceName(payment),
+        [TX_CARD_BRAND]: getCardBrand(payment),
+        [TX_RECEIPT_URL]: payment.receipt_url || "",
+        [TX_IMPORT_STATUS]: selectValue(IMPORT_STATUS_API_RETRIEVED),
+        [TX_EXCEPTION_TYPE]: "",
+        [TX_TRANSACTION_PROCESSED]: true,
+        [TX_WEBHOOK_EVENTS]: webhookLinks,
+        [TX_PRIMARY_PROCESSOR_EVENT_ID]: primaryProcessorEventId,
+        [TX_RAW_PAYLOAD]: stringifySafe({
+            payment,
+            order
+        })
+    };
+
+    if (!existingTransactionRecord) {
+        fields[TX_LINES_CREATED] = false;
+        fields[TX_INVENTORY_MOVEMENTS_CREATED] = false;
+        fields[TX_NOTES] = "";
+    }
+
+    return fields;
+}
+
+async function updateSyncLogAsProcessed(syncLogRecordId, transactionRecordId, rawApiResponse) {
+    await syncLogTable.updateRecordAsync(syncLogRecordId, {
+        [SL_PROCESSING_STATUS]: selectValue(STATUS_PROCESSED),
+        [SL_AUTOMATION_STEP]: selectValue(STEP_PAYMENT_RETRIEVED),
+        [SL_RELATED_TRANSACTION]: [{ id: transactionRecordId }],
+        [SL_RAW_API_RESPONSE]: stringifySafe(rawApiResponse),
+        [SL_ERROR_MESSAGE]: "",
+        [SL_RESOLVED]: true,
+        [SL_RESOLVED_NOTES]: "Payment retrieved from Square API and parent TRANSACTIONS record created or updated."
+    });
+}
+
+async function updateSyncLogAsFailed(syncLogRecordId, errorMessage) {
+    await syncLogTable.updateRecordAsync(syncLogRecordId, {
+        [SL_PROCESSING_STATUS]: selectValue(STATUS_FAILED),
+        [SL_AUTOMATION_STEP]: selectValue(STEP_FAILED),
+        [SL_ERROR_MESSAGE]: errorMessage,
+        [SL_RESOLVED]: false
+    });
+}
+
+async function main() {
+    if (!syncLogRecordId) {
+        throw new Error("Missing required automation input: syncLogRecordId.");
+    }
+
+    if (!SQUARE_ACCESS_TOKEN) {
+        throw new Error("Missing Airtable secret: SQUARE_SANDBOX_ACCESS_TOKEN.");
+    }
+
+    const syncLogRecord = await getSyncLogRecord(syncLogRecordId);
+
+    if (!syncLogRecord) {
+        throw new Error(`Could not find SYNC LOG record: ${syncLogRecordId}`);
+    }
+
+    const processorEventId = syncLogRecord.getCellValueAsString(SL_PROCESSOR_EVENT_ID);
+    const paymentProcessor = syncLogRecord.getCellValueAsString(SL_PAYMENT_PROCESSOR);
+    const processingStatus = syncLogRecord.getCellValueAsString(SL_PROCESSING_STATUS);
+    const eventType = syncLogRecord.getCellValueAsString(SL_EVENT_TYPE);
+    const processorObjectType = syncLogRecord.getCellValueAsString(SL_PROCESSOR_OBJECT_TYPE);
+    const processorObjectId = syncLogRecord.getCellValueAsString(SL_PROCESSOR_OBJECT_ID);
+
+    if (paymentProcessor !== PROCESSOR_SQUARE) {
+        throw new Error(`POS-2 only processes Square events. Found Payment Processor: ${paymentProcessor}`);
+    }
+
+    if (processingStatus !== STATUS_RECEIVED) {
+        throw new Error(`POS-2 only processes SYNC LOG records with Processing Status = Received. Found: ${processingStatus}`);
+    }
+
+    if (processorObjectType !== OBJECT_TYPE_PAYMENT) {
+        throw new Error(`POS-2 only processes Processor Object Type = Payment. Found: ${processorObjectType}`);
+    }
+
+    if (!eventType.startsWith("payment.")) {
+        throw new Error(`POS-2 only processes payment.* events. Found Event Type: ${eventType}`);
+    }
+
+    if (!processorObjectId) {
+        throw new Error("SYNC LOG record is missing Processor Object ID.");
+    }
+
+    const paymentResponse = await squareGet(`/v2/payments/${processorObjectId}`);
+    const payment = paymentResponse.payment;
+
+    if (!payment?.id) {
+        throw new Error(`Square payment response did not include a payment.id for Processor Object ID: ${processorObjectId}`);
+    }
+
+    let orderResponse = null;
+    let order = null;
+
+    if (payment.order_id) {
+        orderResponse = await squareGet(`/v2/orders/${payment.order_id}`);
+        order = orderResponse.order || null;
+    }
+
+    const existingTransaction = await findTransactionByProcessorPaymentId(payment.id);
+
+    const transactionFields = buildTransactionFields({
+        payment,
+        order,
+        syncLogRecordId,
+        processorEventId,
+        existingTransactionRecord: existingTransaction
+    });
+
+    let transactionRecordId;
+
+    if (existingTransaction) {
+        await transactionsTable.updateRecordAsync(existingTransaction.id, transactionFields);
+        transactionRecordId = existingTransaction.id;
+    } else {
+        transactionRecordId = await transactionsTable.createRecordAsync(transactionFields);
+    }
+
+    await updateSyncLogAsProcessed(syncLogRecordId, transactionRecordId, {
+        paymentResponse,
+        orderResponse
+    });
+
+    output.set("result", existingTransaction ? "updated_transaction" : "created_transaction");
+    output.set("syncLogRecordId", syncLogRecordId);
+    output.set("transactionRecordId", transactionRecordId);
+    output.set("processorPaymentId", payment.id);
+    output.set("processorOrderId", payment.order_id || "");
+    output.set("primaryProcessorEventId", processorEventId);
+    output.set("eventType", eventType);
+}
+
+try {
+    await main();
+} catch (error) {
+    output.set("result", "failed");
+    output.set("error", error.message);
+
+    if (syncLogRecordId) {
+        try {
+            await updateSyncLogAsFailed(syncLogRecordId, error.message);
+        } catch (updateError) {
+            output.set("syncLogFailureUpdateError", updateError.message);
+        }
+    }
+
+    throw error;
+}
