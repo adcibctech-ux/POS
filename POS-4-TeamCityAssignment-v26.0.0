@@ -1,0 +1,492 @@
+/***************************************************************
+ * SCRIPT: POS-4-TeamCityAssignment-v26.0.0
+ * SYSTEM: ADC|IBC POS Backend
+ * TABLE(S): TRANSACTIONS, TOUR SCHEDULE, INVENTORY LOCATIONS
+ *
+ * PURPOSE:
+ * Assigns in-person POS transactions to the correct tour city and
+ * sales team/inventory location based on transaction timestamp and
+ * Square staff ID.
+ *
+ * VERSIONING:
+ * POS-4-TeamCityAssignment-v26.0.0
+ *
+ * Version format:
+ * - POS-4 = major POS workflow/script number.
+ * - v26 = 2026 system standard.
+ * - .0 = first POS-4 logic release.
+ * - .0 = first drop-in script release of this POS-4 workflow.
+ *
+ * SCRIPT BEHAVIOR:
+ * 1. Reads the triggering TRANSACTIONS record ID from automation input.
+ * 2. Verifies transaction is an In-Person POS transaction.
+ * 3. Verifies transaction lines have already been created.
+ * 4. Finds active TOUR SCHEDULE records where transaction timestamp
+ *    falls between Start Date/Time and End Date/Time.
+ * 5. Allows up to 3 city matches because up to 3 teams may run
+ *    concurrent city events in a weekend.
+ * 6. Matches TRANSACTIONS → Processor Staff ID to
+ *    INVENTORY LOCATIONS → Processor Staff Identifier.
+ * 7. Limits team matching to active Square Sales Team inventory locations.
+ * 8. Intersects matched staff/team location with matched city schedule.
+ * 9. If exactly 1 final city/team assignment is found:
+ *    - writes Assigned City
+ *    - writes Assigned Team
+ *    - writes Processor Location Name as "Inventory Location - City"
+ *    - clears exceptions to None
+ *    - keeps Import Status as API Retrieved
+ * 10. If no/ambiguous match is found:
+ *    - writes Import Status = Needs Review
+ *    - writes Exception Type with the correct issue
+ *    - appends a diagnostic note
+ * 11. Does not create inventory movements.
+ *
+ * BUG FIXES / REVISION NOTES:
+ * v26.0.0
+ * - Initial POS-4 release.
+ * - Uses active-season TOUR SCHEDULE matching.
+ * - Uses Staff ID → INVENTORY LOCATIONS matching.
+ * - Supports up to 3 concurrent city matches before flagging ambiguity.
+ * - Writes linked Assigned City and Assigned Team records.
+ *
+ * REQUIRED AIRTABLE AUTOMATION INPUTS:
+ * - transactionRecordId: Record ID of the triggering TRANSACTIONS record.
+ *
+ * REQUIRED TABLES:
+ * - TRANSACTIONS
+ * - TOUR SCHEDULE
+ * - INVENTORY LOCATIONS
+ ***************************************************************/
+
+const config = input.config();
+const transactionRecordId = config.transactionRecordId;
+
+const TRANSACTIONS_TABLE = "TRANSACTIONS";
+const TOUR_SCHEDULE_TABLE = "TOUR SCHEDULE";
+const INVENTORY_LOCATIONS_TABLE = "INVENTORY LOCATIONS";
+
+// TRANSACTIONS fields
+const TX_PAYMENT_PROCESSOR = "Payment Processor";
+const TX_SALES_CHANNEL = "Sales Channel";
+const TX_TRANSACTION_TIMESTAMP = "Transaction Timestamp";
+const TX_PROCESSOR_LOCATION_NAME = "Processor Location Name";
+const TX_PROCESSOR_STAFF_ID = "Processor Staff ID";
+const TX_ASSIGNED_TEAM = "Assigned Team";
+const TX_ASSIGNED_CITY = "Assigned City";
+const TX_IMPORT_STATUS = "Import Status";
+const TX_EXCEPTION_TYPE = "Exception Type";
+const TX_LINES_CREATED = "Lines Created?";
+const TX_INVENTORY_MOVEMENTS_CREATED = "Inventory Movements Created?";
+const TX_NOTES = "Notes";
+
+// TOUR SCHEDULE fields
+const TS_CITY = "City";
+const TS_TEAM = "Team";
+const TS_START = "Start Date/Time";
+const TS_END = "End Date/Time";
+const TS_SALES_CHANNEL = "Sales Channel";
+const TS_ACTIVE = "Active?";
+
+// INVENTORY LOCATIONS fields
+const IL_INVENTORY_LOCATION = "Inventory Location";
+const IL_LOCATION_TYPE = "Location Type";
+const IL_PROCESSOR_STAFF_IDENTIFIER = "Processor Staff Identifier";
+const IL_PAYMENT_PROCESSOR = "Payment Processor";
+const IL_ACTIVE = "Active";
+const IL_TOUR_SCHEDULE = "Tour Schedule";
+
+// Select values
+const PROCESSOR_SQUARE = "Square";
+const SALES_CHANNEL_IN_PERSON_POS = "In-Person POS";
+const LOCATION_TYPE_SALES_TEAM = "Sales Team";
+
+const IMPORT_STATUS_API_RETRIEVED = "API Retrieved";
+const IMPORT_STATUS_NEEDS_REVIEW = "Needs Review";
+
+const EXCEPTION_NONE = "None";
+const EXCEPTION_NO_CITY_MATCH = "No City Match";
+const EXCEPTION_NO_TEAM_MATCH = "No Team Match";
+const EXCEPTION_AMBIGUOUS_ASSIGNMENT = "Ambiguous Assignment";
+
+const MAX_ALLOWED_CITY_MATCHES = 3;
+
+const transactionsTable = base.getTable(TRANSACTIONS_TABLE);
+const tourScheduleTable = base.getTable(TOUR_SCHEDULE_TABLE);
+const inventoryLocationsTable = base.getTable(INVENTORY_LOCATIONS_TABLE);
+
+function selectValue(name) {
+    return { name };
+}
+
+function multiSelectValues(names) {
+    return [...new Set(names.filter(Boolean))].map(name => ({ name }));
+}
+
+function normalizeText(value) {
+    if (!value) {
+        return "";
+    }
+
+    return String(value).trim();
+}
+
+function getSelectName(record, fieldName) {
+    return record.getCellValue(fieldName)?.name || "";
+}
+
+function getLinkedIds(record, fieldName) {
+    const linkedRecords = record.getCellValue(fieldName) || [];
+    return linkedRecords.map(linkedRecord => linkedRecord.id);
+}
+
+function appendNote(existingNotes, newNote) {
+    const cleanExisting = normalizeText(existingNotes);
+    const timestamp = new Date().toISOString();
+    const noteToAppend = `[${timestamp}] POS-4: ${newNote}`;
+
+    if (!cleanExisting) {
+        return noteToAppend;
+    }
+
+    return `${cleanExisting}\n${noteToAppend}`;
+}
+
+function isTimestampWithinSchedule(transactionDate, scheduleRecord) {
+    const startRaw = scheduleRecord.getCellValue(TS_START);
+    const endRaw = scheduleRecord.getCellValue(TS_END);
+
+    if (!startRaw || !endRaw) {
+        return false;
+    }
+
+    const startDate = new Date(startRaw);
+    const endDate = new Date(endRaw);
+
+    return transactionDate >= startDate && transactionDate <= endDate;
+}
+
+function getCityName(tourScheduleRecord) {
+    return tourScheduleRecord.getCellValueAsString(TS_CITY);
+}
+
+function getInventoryLocationName(inventoryLocationRecord) {
+    return inventoryLocationRecord.getCellValueAsString(IL_INVENTORY_LOCATION);
+}
+
+async function getTransactionRecord(recordId) {
+    const query = await transactionsTable.selectRecordsAsync({
+        fields: [
+            TX_PAYMENT_PROCESSOR,
+            TX_SALES_CHANNEL,
+            TX_TRANSACTION_TIMESTAMP,
+            TX_PROCESSOR_LOCATION_NAME,
+            TX_PROCESSOR_STAFF_ID,
+            TX_ASSIGNED_TEAM,
+            TX_ASSIGNED_CITY,
+            TX_IMPORT_STATUS,
+            TX_EXCEPTION_TYPE,
+            TX_LINES_CREATED,
+            TX_INVENTORY_MOVEMENTS_CREATED,
+            TX_NOTES
+        ]
+    });
+
+    return query.getRecord(recordId);
+}
+
+async function getTourScheduleRecords() {
+    const query = await tourScheduleTable.selectRecordsAsync({
+        fields: [
+            TS_CITY,
+            TS_TEAM,
+            TS_START,
+            TS_END,
+            TS_SALES_CHANNEL,
+            TS_ACTIVE
+        ]
+    });
+
+    return query.records;
+}
+
+async function getInventoryLocationRecords() {
+    const query = await inventoryLocationsTable.selectRecordsAsync({
+        fields: [
+            IL_INVENTORY_LOCATION,
+            IL_LOCATION_TYPE,
+            IL_PROCESSOR_STAFF_IDENTIFIER,
+            IL_PAYMENT_PROCESSOR,
+            IL_ACTIVE,
+            IL_TOUR_SCHEDULE
+        ]
+    });
+
+    return query.records;
+}
+
+function filterCityMatches({
+    tourScheduleRecords,
+    transactionDate
+}) {
+    return tourScheduleRecords.filter(scheduleRecord => {
+        const active = scheduleRecord.getCellValue(TS_ACTIVE) === true;
+        const salesChannel = getSelectName(scheduleRecord, TS_SALES_CHANNEL);
+
+        return (
+            active &&
+            salesChannel === SALES_CHANNEL_IN_PERSON_POS &&
+            isTimestampWithinSchedule(transactionDate, scheduleRecord)
+        );
+    });
+}
+
+function filterTeamMatches({
+    inventoryLocationRecords,
+    processorStaffId
+}) {
+    const normalizedProcessorStaffId = normalizeText(processorStaffId);
+
+    if (!normalizedProcessorStaffId) {
+        return [];
+    }
+
+    return inventoryLocationRecords.filter(locationRecord => {
+        const active = locationRecord.getCellValue(IL_ACTIVE) === true;
+        const paymentProcessor = getSelectName(locationRecord, IL_PAYMENT_PROCESSOR);
+        const locationType = getSelectName(locationRecord, IL_LOCATION_TYPE);
+        const locationStaffId = normalizeText(locationRecord.getCellValueAsString(IL_PROCESSOR_STAFF_IDENTIFIER));
+
+        return (
+            active &&
+            paymentProcessor === PROCESSOR_SQUARE &&
+            locationType === LOCATION_TYPE_SALES_TEAM &&
+            locationStaffId === normalizedProcessorStaffId
+        );
+    });
+}
+
+function intersectCityAndTeamMatches({
+    cityMatches,
+    teamMatches
+}) {
+    const cityIds = new Set(cityMatches.map(cityRecord => cityRecord.id));
+
+    const finalMatches = [];
+
+    for (const teamRecord of teamMatches) {
+        const linkedTourScheduleIds = getLinkedIds(teamRecord, IL_TOUR_SCHEDULE);
+
+        for (const linkedTourScheduleId of linkedTourScheduleIds) {
+            if (!cityIds.has(linkedTourScheduleId)) {
+                continue;
+            }
+
+            const matchedCityRecord = cityMatches.find(cityRecord => cityRecord.id === linkedTourScheduleId);
+
+            if (matchedCityRecord) {
+                finalMatches.push({
+                    cityRecord: matchedCityRecord,
+                    teamRecord
+                });
+            }
+        }
+    }
+
+    return finalMatches;
+}
+
+async function markNeedsReview({
+    transactionRecord,
+    exceptionTypes,
+    note
+}) {
+    await transactionsTable.updateRecordAsync(transactionRecord.id, {
+        [TX_IMPORT_STATUS]: selectValue(IMPORT_STATUS_NEEDS_REVIEW),
+        [TX_EXCEPTION_TYPE]: multiSelectValues(exceptionTypes),
+        [TX_NOTES]: appendNote(
+            transactionRecord.getCellValueAsString(TX_NOTES),
+            note
+        )
+    });
+
+    output.set("result", "needs_review");
+    output.set("transactionRecordId", transactionRecord.id);
+    output.set("exceptionTypes", exceptionTypes);
+    output.set("note", note);
+}
+
+async function markAssigned({
+    transactionRecord,
+    cityRecord,
+    teamRecord
+}) {
+    const cityName = getCityName(cityRecord);
+    const teamName = getInventoryLocationName(teamRecord);
+    const processorLocationName = `${teamName} - ${cityName}`;
+
+    await transactionsTable.updateRecordAsync(transactionRecord.id, {
+        [TX_ASSIGNED_CITY]: [{ id: cityRecord.id }],
+        [TX_ASSIGNED_TEAM]: [{ id: teamRecord.id }],
+        [TX_PROCESSOR_LOCATION_NAME]: processorLocationName,
+        [TX_IMPORT_STATUS]: selectValue(IMPORT_STATUS_API_RETRIEVED),
+        [TX_EXCEPTION_TYPE]: multiSelectValues([EXCEPTION_NONE]),
+        [TX_NOTES]: appendNote(
+            transactionRecord.getCellValueAsString(TX_NOTES),
+            `Assigned to ${processorLocationName}.`
+        )
+    });
+
+    output.set("result", "assigned");
+    output.set("transactionRecordId", transactionRecord.id);
+    output.set("assignedCityRecordId", cityRecord.id);
+    output.set("assignedCity", cityName);
+    output.set("assignedTeamRecordId", teamRecord.id);
+    output.set("assignedTeam", teamName);
+    output.set("processorLocationName", processorLocationName);
+}
+
+async function main() {
+    if (!transactionRecordId) {
+        throw new Error("Missing required automation input: transactionRecordId.");
+    }
+
+    const transactionRecord = await getTransactionRecord(transactionRecordId);
+
+    if (!transactionRecord) {
+        throw new Error(`Could not find TRANSACTIONS record: ${transactionRecordId}`);
+    }
+
+    const paymentProcessor = getSelectName(transactionRecord, TX_PAYMENT_PROCESSOR);
+    const salesChannel = getSelectName(transactionRecord, TX_SALES_CHANNEL);
+    const transactionTimestampRaw = transactionRecord.getCellValue(TX_TRANSACTION_TIMESTAMP);
+    const processorStaffId = transactionRecord.getCellValueAsString(TX_PROCESSOR_STAFF_ID);
+    const linesCreated = transactionRecord.getCellValue(TX_LINES_CREATED);
+    const inventoryMovementsCreated = transactionRecord.getCellValue(TX_INVENTORY_MOVEMENTS_CREATED);
+
+    if (paymentProcessor !== PROCESSOR_SQUARE) {
+        output.set("result", "skipped_non_square");
+        output.set("paymentProcessor", paymentProcessor);
+        return;
+    }
+
+    if (salesChannel !== SALES_CHANNEL_IN_PERSON_POS) {
+        output.set("result", "skipped_non_in_person_pos");
+        output.set("salesChannel", salesChannel);
+        return;
+    }
+
+    if (!linesCreated) {
+        await markNeedsReview({
+            transactionRecord,
+            exceptionTypes: [EXCEPTION_AMBIGUOUS_ASSIGNMENT],
+            note: "Lines Created? is not checked. POS-4 requires POS-3 to complete first."
+        });
+        return;
+    }
+
+    if (inventoryMovementsCreated) {
+        output.set("result", "skipped_inventory_movements_already_created");
+        output.set("transactionRecordId", transactionRecord.id);
+        return;
+    }
+
+    if (!transactionTimestampRaw) {
+        await markNeedsReview({
+            transactionRecord,
+            exceptionTypes: [EXCEPTION_NO_CITY_MATCH],
+            note: "Transaction Timestamp is empty; cannot match to TOUR SCHEDULE."
+        });
+        return;
+    }
+
+    const transactionDate = new Date(transactionTimestampRaw);
+
+    if (Number.isNaN(transactionDate.getTime())) {
+        await markNeedsReview({
+            transactionRecord,
+            exceptionTypes: [EXCEPTION_NO_CITY_MATCH],
+            note: `Transaction Timestamp could not be parsed: ${transactionTimestampRaw}`
+        });
+        return;
+    }
+
+    const tourScheduleRecords = await getTourScheduleRecords();
+    const inventoryLocationRecords = await getInventoryLocationRecords();
+
+    const cityMatches = filterCityMatches({
+        tourScheduleRecords,
+        transactionDate
+    });
+
+    if (cityMatches.length === 0) {
+        await markNeedsReview({
+            transactionRecord,
+            exceptionTypes: [EXCEPTION_NO_CITY_MATCH],
+            note: "No active TOUR SCHEDULE record matched the transaction timestamp."
+        });
+        return;
+    }
+
+    if (cityMatches.length > MAX_ALLOWED_CITY_MATCHES) {
+        await markNeedsReview({
+            transactionRecord,
+            exceptionTypes: [EXCEPTION_AMBIGUOUS_ASSIGNMENT],
+            note: `More than ${MAX_ALLOWED_CITY_MATCHES} TOUR SCHEDULE records matched the transaction timestamp. Matched cities: ${cityMatches.map(getCityName).join(", ")}.`
+        });
+        return;
+    }
+
+    if (!normalizeText(processorStaffId)) {
+        await markNeedsReview({
+            transactionRecord,
+            exceptionTypes: [EXCEPTION_NO_TEAM_MATCH],
+            note: `Matched ${cityMatches.length} city record(s), but Processor Staff ID is blank. Cannot assign team. Matched cities: ${cityMatches.map(getCityName).join(", ")}.`
+        });
+        return;
+    }
+
+    const teamMatches = filterTeamMatches({
+        inventoryLocationRecords,
+        processorStaffId
+    });
+
+    if (teamMatches.length === 0) {
+        await markNeedsReview({
+            transactionRecord,
+            exceptionTypes: [EXCEPTION_NO_TEAM_MATCH],
+            note: `No active Square Sales Team inventory location matched Processor Staff ID ${processorStaffId}.`
+        });
+        return;
+    }
+
+    const finalMatches = intersectCityAndTeamMatches({
+        cityMatches,
+        teamMatches
+    });
+
+    if (finalMatches.length === 0) {
+        await markNeedsReview({
+            transactionRecord,
+            exceptionTypes: [EXCEPTION_NO_TEAM_MATCH],
+            note: `Processor Staff ID ${processorStaffId} matched inventory location(s), but none were linked to the timestamp-matched TOUR SCHEDULE city record(s). City matches: ${cityMatches.map(getCityName).join(", ")}. Team matches: ${teamMatches.map(getInventoryLocationName).join(", ")}.`
+        });
+        return;
+    }
+
+    if (finalMatches.length > 1) {
+        await markNeedsReview({
+            transactionRecord,
+            exceptionTypes: [EXCEPTION_AMBIGUOUS_ASSIGNMENT],
+            note: `More than one final city/team assignment matched. Matches: ${finalMatches.map(match => `${getInventoryLocationName(match.teamRecord)} - ${getCityName(match.cityRecord)}`).join("; ")}.`
+        });
+        return;
+    }
+
+    await markAssigned({
+        transactionRecord,
+        cityRecord: finalMatches[0].cityRecord,
+        teamRecord: finalMatches[0].teamRecord
+    });
+}
+
+await main();
