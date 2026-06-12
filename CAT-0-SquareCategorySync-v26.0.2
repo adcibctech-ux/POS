@@ -1,5 +1,5 @@
 /***************************************************************
- * SCRIPT: CAT-0-SquareCategorySync-v26.0.1
+ * SCRIPT: CAT-0-SquareCategorySync-v26.0.2
  * SYSTEM: ADC|IBC POS Backend
  * TABLE(S): PROCESSOR CATEGORY MAP, ITEM LIBRARY
  *
@@ -9,13 +9,13 @@
  * hierarchy for sub-categories.
  *
  * VERSIONING:
- * CAT-0-SquareCategorySync-v26.0.1
+ * CAT-0-SquareCategorySync-v26.0.2
  *
  * Version format:
  * - CAT-0 = category sync workflow/script number.
  * - v26 = 2026 system standard.
  * - .0 = first CAT-0 logic release branch.
- * - .1 = category hierarchy bug-fix iteration.
+ * - .2 = idempotency key bug-fix iteration.
  *
  * SCRIPT BEHAVIOR:
  * 1. Runs from an Airtable automation triggered when one category-map
@@ -32,7 +32,7 @@
  *    - infers parent category from ITEM LIBRARY using:
  *        ITEM LIBRARY Sub-Category → ITEM LIBRARY Parent Category
  *    - finds the matching synced parent record in PROCESSOR CATEGORY MAP.
- *    - creates/updates the Square CATEGORY with parent_category.id.
+ *    - creates/updates the Square CATEGORY with category_data.parent_category.id.
  * 6. If Processor Category ID is blank:
  *    - creates a new Square CATEGORY object.
  * 7. If Processor Category ID exists:
@@ -50,8 +50,13 @@
  *    - saves Raw Sync Response if available
  *
  * BUG FIXES / REVISION NOTES:
+ * v26.0.2
+ * - Fixed Square IDEMPOTENCY_KEY_REUSED errors on category creation.
+ * - Category create idempotency key now includes Date.now() so retried
+ *   category creates with changed payloads are accepted.
+ *
  * v26.0.1
- * - Adds Square category hierarchy support for sub-categories.
+ * - Added Square category hierarchy support for sub-categories.
  * - Sub-categories now attach to their synced parent Square category using category_data.parent_category.id.
  * - Parent category is inferred from ITEM LIBRARY Parent Category/Sub-Category relationships.
  *
@@ -385,7 +390,7 @@ async function createSquareCategory(categoryRecord, payload, parentReference) {
     const tempCategoryId = makeTempCategoryId(payload.categoryName, categoryRecord.id);
 
     const requestBody = {
-        idempotency_key: `cat0-prod-create-${categoryRecord.id}`,
+        idempotency_key: `cat0-prod-create-${categoryRecord.id}-${Date.now()}`,
         object: {
             id: tempCategoryId,
             type: "CATEGORY",
