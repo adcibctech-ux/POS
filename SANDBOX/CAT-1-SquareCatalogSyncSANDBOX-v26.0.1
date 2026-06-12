@@ -1,5 +1,5 @@
 /***************************************************************
- * SCRIPT: CAT-1-SquareCatalogSyncSANDBOX-v26.0.0
+ * SCRIPT: CAT-1-SquareCatalogSyncSANDBOX-v26.0.1
  * SYSTEM: ADC|IBC POS Backend
  * TABLE(S): PROCESSOR CATALOG MAP, ITEM LIBRARY
  *
@@ -8,13 +8,29 @@
  * SANDBOX and writes returned Square catalog IDs back to Airtable.
  *
  * VERSIONING:
- * CAT-1-SquareCatalogSyncSANDBOX-v26.0.0
+ * CAT-1-SquareCatalogSyncSANDBOX-v26.0.1
+ *
+ * Version format:
+ * - CAT-1 = catalog sync workflow/script number.
+ * - v26 = 2026 system standard.
+ * - .0 = first CAT-1 logic release.
+ * - .1 = select option capitalization bug-fix iteration.
  *
  * SCRIPT BEHAVIOR:
- * Same behavior as CAT-1-SquareCatalogSync-v26.0.0, but:
+ * Same behavior as CAT-1-SquareCatalogSync-v26.0.1, but:
  * - requires Processor Environment = SANDBOX
  * - uses the Square sandbox endpoint
  * - uses SQUARE_SANDBOX_ACCESS_TOKEN
+ *
+ * BUG FIXES / REVISION NOTES:
+ * v26.0.1
+ * - Updated single-select values to match all-caps Airtable options.
+ * - Sync Status now writes READY TO SYNC, SYNCED, SYNC ERROR, NEEDS REVIEW.
+ * - Catalog Processor now expects SQUARE.
+ * - Processor Environment now expects SANDBOX.
+ *
+ * v26.0.0
+ * - Initial sandbox Square catalog sync release.
  *
  * REQUIRED AIRTABLE AUTOMATION INPUTS:
  * - catalogMapRecordId
@@ -34,7 +50,6 @@ const CATALOG_MAP_TABLE_ID = "tbliIMV8WXiUCmpWd";
 const ITEM_LIBRARY_TABLE = "ITEM LIBRARY";
 
 // PROCESSOR CATALOG MAP fields
-const MAP_PRIMARY = "Catalog Map ID";
 const MAP_ITEM = "Item";
 const MAP_CATALOG_PROCESSOR = "Catalog Processor";
 const MAP_PROCESSOR_ENVIRONMENT = "Processor Environment";
@@ -59,13 +74,13 @@ const ITEM_VARIANT_NAME = "Variant Name";
 const ITEM_UNIT_PRICE = "Unit Price";
 const ITEM_ACTIVE = "Active?";
 
-// Select values
-const PROCESSOR_SQUARE = "Square";
+// All-caps Airtable select option values
+const PROCESSOR_SQUARE = "SQUARE";
 const ENVIRONMENT_SANDBOX = "SANDBOX";
-const STATUS_READY_TO_SYNC = "Ready to Sync";
-const STATUS_SYNCED = "Synced";
-const STATUS_SYNC_ERROR = "Sync Error";
-const STATUS_NEEDS_REVIEW = "Needs Review";
+const STATUS_READY_TO_SYNC = "READY TO SYNC";
+const STATUS_SYNCED = "SYNCED";
+const STATUS_SYNC_ERROR = "SYNC ERROR";
+const STATUS_NEEDS_REVIEW = "NEEDS REVIEW";
 
 const catalogMapTable = base.getTable(CATALOG_MAP_TABLE_ID);
 const itemLibraryTable = base.getTable(ITEM_LIBRARY_TABLE);
@@ -119,6 +134,11 @@ function safeStringify(value) {
 function getIdFromMappings(idMappings, clientObjectId) {
     const mapping = (idMappings || []).find(item => item.client_object_id === clientObjectId);
     return mapping?.object_id || null;
+}
+
+function getNumberVersion(value) {
+    const numeric = Number(normalizeText(value));
+    return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
 }
 
 async function squareRequest(path, method, body) {
@@ -280,7 +300,7 @@ async function createSquareCatalogObject(mapRecord, payload) {
     const tempVariationId = makeTempId(`${payload.processorSku}-VAR`, "ITEM-VARIATION");
 
     const requestBody = {
-        idempotency_key: `cat1-sandbox-create-${mapRecord.id}-${Date.now()}`,
+        idempotency_key: `cat1-sandbox-create-${mapRecord.id}`,
         object: {
             id: tempItemId,
             type: "ITEM",
@@ -335,28 +355,35 @@ async function createSquareCatalogObject(mapRecord, payload) {
 async function updateSquareCatalogObject(mapRecord, payload) {
     const itemId = normalizeText(mapRecord.getCellValueAsString(MAP_PROCESSOR_ITEM_ID));
     const variationId = normalizeText(mapRecord.getCellValueAsString(MAP_PROCESSOR_VARIATION_ID));
+    const existingVersion = getNumberVersion(mapRecord.getCellValueAsString(MAP_PROCESSOR_CATALOG_VERSION));
 
     if (!itemId || !variationId) {
         throw new Error("Cannot update because Processor Item ID or Processor Variation ID is blank.");
     }
 
-    const requestBody = {
-        idempotency_key: `cat1-sandbox-update-${mapRecord.id}-${Date.now()}`,
-        object: {
-            id: variationId,
-            type: "ITEM_VARIATION",
-            present_at_all_locations: true,
-            item_variation_data: {
-                item_id: itemId,
-                name: payload.processorVariationName,
-                sku: payload.processorSku,
-                pricing_type: "FIXED_PRICING",
-                price_money: {
-                    amount: payload.amountCents,
-                    currency: "USD"
-                }
+    const object = {
+        id: variationId,
+        type: "ITEM_VARIATION",
+        present_at_all_locations: true,
+        item_variation_data: {
+            item_id: itemId,
+            name: payload.processorVariationName,
+            sku: payload.processorSku,
+            pricing_type: "FIXED_PRICING",
+            price_money: {
+                amount: payload.amountCents,
+                currency: "USD"
             }
         }
+    };
+
+    if (existingVersion) {
+        object.version = existingVersion;
+    }
+
+    const requestBody = {
+        idempotency_key: `cat1-sandbox-update-${mapRecord.id}-${Date.now()}`,
+        object
     };
 
     const response = await squareRequest("/v2/catalog/object", "POST", requestBody);
