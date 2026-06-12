@@ -1,0 +1,879 @@
+/***************************************************************
+ * SCRIPT: CAT-1-SquareCatalogSync-v26.2.0
+ * SYSTEM: ADC|IBC POS Backend
+ * TABLE(S): PROCESSOR CATALOG MAP, ITEM LIBRARY, PROCESSOR CATEGORY MAP
+ *
+ * PURPOSE:
+ * Batch creates/updates Square PRODUCTION catalog items and item
+ * variations from PROCESSOR CATALOG MAP records.
+ *
+ * VERSIONING:
+ * CAT-1-SquareCatalogSync-v26.2.0
+ *
+ * Version format:
+ * - CAT-1 = item/catalog sync workflow/script number.
+ * - v26 = 2026 system standard.
+ * - .2 = major structural update: single-record item sync converted to
+ *        batch item/variation sync.
+ * - .0 = first release of the v26.2 batch item-sync branch.
+ *
+ * SCRIPT BEHAVIOR:
+ * 1. Runs when one PROCESSOR CATALOG MAP record enters the Ready for
+ *    Catalog Sync view.
+ * 2. Uses that trigger as a batch kick-off.
+ * 3. Processes all eligible PROCESSOR CATALOG MAP records where:
+ *    - Catalog Processor = SQUARE
+ *    - Processor Environment = PRODUCTION
+ *    - Sync to Processor? = checked
+ *    - Sync Status = READY TO SYNC
+ * 4. Groups catalog map records into Square parent ITEM objects by:
+ *    - Processor Item Name
+ *    - Processor Category
+ * 5. Each PROCESSOR CATALOG MAP record becomes one Square ITEM_VARIATION.
+ * 6. All sibling variations in the same group receive the same:
+ *    - Processor Item ID
+ * 7. Each variation receives its own:
+ *    - Processor Variation ID
+ *    - Processor Catalog Object ID
+ * 8. Requires exactly one linked ITEM LIBRARY record per catalog-map record.
+ * 9. Requires exactly one linked Processor Category record per catalog-map record.
+ *    - If missing/multiple: sets Sync Status = NEEDS REVIEW.
+ * 10. Requires linked Processor Category to already have a Processor Category ID.
+ *    - If missing: sets Sync Status = SYNC ERROR.
+ * 11. Assigns the linked specific category to Square using:
+ *    - item_data.categories = [{ id: Processor Category ID }]
+ *    - item_data.reporting_category = { id: Processor Category ID }
+ * 12. Does NOT assign the parent category to Square.
+ *    - Processor Parent Category remains Airtable-only reporting metadata.
+ * 13. Uses Square Catalog Batch Upsert:
+ *    - one request
+ *    - multiple Square ITEM objects
+ *    - each ITEM contains its grouped ITEM_VARIATION objects
+ * 14. On success:
+ *    - writes Processor Item ID
+ *    - writes Processor Variation ID
+ *    - writes Processor Catalog Object ID
+ *    - writes Processor Catalog Version
+ *    - sets Sync Status = SYNCED
+ *    - sets Last Sync At = now
+ *    - clears Sync Error
+ *    - saves Raw Sync Response
+ * 15. On failure:
+ *    - sets READY TO SYNC records involved in the attempted batch to SYNC ERROR
+ *    - writes Sync Error
+ *    - saves Raw Sync Response if available
+ *
+ * UPDATES / BUG FIXES:
+ * v26.2.0
+ * - Major structural change from single-record item sync to batch item sync.
+ * - Groups sibling variation records into shared Square ITEM objects.
+ * - Each PROCESSOR CATALOG MAP record now maps to a Square ITEM_VARIATION.
+ * - All sibling variations now share the same Processor Item ID.
+ * - Each variation keeps its own Processor Variation ID for inventory and sales tracking.
+ * - Uses Processor Item Name + Processor Category as the grouping key.
+ * - Assigns the linked Processor Category as both Square item category and reporting category.
+ * - Uses Square Catalog Batch Upsert endpoint.
+ *
+ * v26.1.0
+ * - Added support for updated PROCESSOR CATALOG MAP category mapping schema:
+ *     Processor Category
+ *     Processor Parent Category
+ * - Required Processor Category to be linked before syncing.
+ * - Used linked Processor Category ID as Square item category/reporting category.
+ *
+ * v26.0.1
+ * - Fixed all-caps Airtable Sync Status option handling.
+ *
+ * v26.0.0
+ * - Initial production Square item/catalog sync release.
+ * - Created/updated one Square ITEM with one ITEM_VARIATION per triggering record.
+ *
+ * IMPORTANT:
+ * - Processor Parent Category is not sent to Square.
+ * - Processor Category must point to the specific category/subcategory that
+ *   should be assigned to the Square item.
+ * - CAT-0 must successfully sync Square categories before CAT-1 item sync.
+ * - If one sibling variation is READY TO SYNC, this script may also include
+ *   already-SYNCED sibling records in the same Square item group so that
+ *   the Square item can be rebuilt with the full variation set.
+ *
+ * REQUIRED AIRTABLE AUTOMATION INPUTS:
+ * - catalogMapRecordId
+ *
+ * REQUIRED AIRTABLE SECRET:
+ * - SQUARE_PRODUCTION_ACCESS_TOKEN
+ ***************************************************************/
+
+const config = input.config();
+const catalogMapRecordId = config.catalogMapRecordId;
+
+const SQUARE_VERSION = "2026-05-20";
+const SQUARE_BASE_URL = "https://connect.squareup.com";
+const SQUARE_ACCESS_TOKEN = input.secret("SQUARE_PRODUCTION_ACCESS_TOKEN");
+
+const PROCESSOR_CATALOG_MAP_TABLE_ID = "tbliIMV8WXiUCmpWd";
+const ITEM_LIBRARY_TABLE_ID = "tblLRCNq7FWidVntW";
+const PROCESSOR_CATEGORY_MAP_TABLE_ID = "tblQeN0UiqavIxdZQ";
+
+// PROCESSOR CATALOG MAP fields
+const PCM_CATALOG_MAP_ID = "Catalog Map ID";
+const PCM_ITEM = "Item";
+const PCM_CATALOG_PROCESSOR = "Catalog Processor";
+const PCM_PROCESSOR_SKU = "Processor SKU";
+const PCM_PROCESSOR_ITEM_NAME = "Processor Item Name";
+const PCM_PROCESSOR_VARIATION_NAME = "Processor Variation Name";
+const PCM_PROCESSOR_UNIT_PRICE = "Processor Unit Price";
+const PCM_PROCESSOR_CATEGORY = "Processor Category";
+const PCM_PROCESSOR_PARENT_CATEGORY = "Processor Parent Category";
+const PCM_PROCESSOR_ITEM_ID = "Processor Item ID";
+const PCM_PROCESSOR_VARIATION_ID = "Processor Variation ID";
+const PCM_PROCESSOR_CATALOG_OBJECT_ID = "Processor Catalog Object ID";
+const PCM_PROCESSOR_ENVIRONMENT = "Processor Environment";
+const PCM_SYNC_TO_PROCESSOR = "Sync to Processor?";
+const PCM_SYNC_STATUS = "Sync Status";
+const PCM_LAST_SYNC_AT = "Last Sync At";
+const PCM_PROCESSOR_CATALOG_VERSION = "Processor Catalog Version";
+const PCM_SYNC_ERROR = "Sync Error";
+const PCM_RAW_SYNC_RESPONSE = "Raw Sync Response";
+
+// ITEM LIBRARY fields
+const ITEM_SKU = "SKU";
+const ITEM_ITEM_NAME = "Item Name";
+const ITEM_VARIANT_NAME = "Variant Name";
+const ITEM_BARCODE_VALUE = "Barcode Value";
+const ITEM_UNIT_PRICE = "Unit Price";
+const ITEM_ACTIVE = "Active?";
+
+// PROCESSOR CATEGORY MAP fields
+const CAT_CATEGORY_MAP_ID = "Category Map ID";
+const CAT_CATALOG_PROCESSOR = "Catalog Processor";
+const CAT_PROCESSOR_ENVIRONMENT = "Processor Environment";
+const CAT_AIRTABLE_CATEGORY_TYPE = "Airtable Category Type";
+const CAT_AIRTABLE_CATEGORY_NAME = "Airtable Category Name";
+const CAT_PROCESSOR_CATEGORY_ID = "Processor Category ID";
+const CAT_PROCESSOR_CATEGORY_NAME = "Processor Category Name";
+const CAT_PROCESSOR_CATEGORY_VERSION = "Processor Category Version";
+const CAT_PARENT_CATEGORY_MAP = "Parent Category Map";
+const CAT_SUBCATEGORY_MAPS = "Subcategory Maps";
+const CAT_SYNC_STATUS = "Sync Status";
+
+// Select option values
+const PROCESSOR_SQUARE = "SQUARE";
+const ENVIRONMENT_PRODUCTION = "PRODUCTION";
+const STATUS_READY_TO_SYNC = "READY TO SYNC";
+const STATUS_SYNCED = "SYNCED";
+const STATUS_SYNC_ERROR = "SYNC ERROR";
+const STATUS_NEEDS_REVIEW = "NEEDS REVIEW";
+
+const processorCatalogMapTable = base.getTable(PROCESSOR_CATALOG_MAP_TABLE_ID);
+const itemLibraryTable = base.getTable(ITEM_LIBRARY_TABLE_ID);
+const processorCategoryMapTable = base.getTable(PROCESSOR_CATEGORY_MAP_TABLE_ID);
+
+function selectValue(name) {
+    return { name };
+}
+
+function getSelectName(record, fieldName) {
+    return record.getCellValue(fieldName)?.name || "";
+}
+
+function normalizeText(value) {
+    if (value === null || value === undefined) return "";
+    return String(value).trim();
+}
+
+function normalizeKey(value) {
+    return normalizeText(value).toLowerCase();
+}
+
+function makeSafeSlug(value) {
+    return normalizeText(value)
+        .toUpperCase()
+        .replace(/[^A-Z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 60);
+}
+
+function safeStringify(value) {
+    try {
+        return JSON.stringify(value, null, 2);
+    } catch (error) {
+        return String(value);
+    }
+}
+
+function getNumberVersion(value) {
+    const numeric = Number(normalizeText(value));
+    return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+}
+
+function dollarsToCents(value) {
+    const numeric = Number(value);
+
+    if (!Number.isFinite(numeric)) {
+        return null;
+    }
+
+    return Math.round(numeric * 100);
+}
+
+function getLinkedRecordIds(record, fieldName) {
+    const links = record.getCellValue(fieldName) || [];
+    return links.map(link => link.id);
+}
+
+function getIdFromMappings(idMappings, clientObjectId) {
+    const mapping = (idMappings || []).find(item =>
+        item.client_object_id === clientObjectId ||
+        item.clientObjectId === clientObjectId
+    );
+
+    return mapping?.object_id || mapping?.objectId || null;
+}
+
+function makeTempItemId(itemName, categoryName, fallbackId) {
+    const safeItem = makeSafeSlug(itemName);
+    const safeCategory = makeSafeSlug(categoryName);
+    const baseId = [safeItem, safeCategory].filter(Boolean).join("-");
+    return `#ITEM-${baseId || fallbackId}`;
+}
+
+function makeTempVariationId(sku, fallbackId) {
+    const safeSku = makeSafeSlug(sku);
+    return `#VARIATION-${safeSku || fallbackId}`;
+}
+
+async function squareRequest(path, method, body) {
+    const response = await fetch(`${SQUARE_BASE_URL}${path}`, {
+        method,
+        headers: {
+            "Square-Version": SQUARE_VERSION,
+            "Authorization": `Bearer ${SQUARE_ACCESS_TOKEN}`,
+            "Content-Type": "application/json"
+        },
+        body: body ? JSON.stringify(body) : undefined
+    });
+
+    const text = await response.text();
+    let json;
+
+    try {
+        json = text ? JSON.parse(text) : {};
+    } catch (error) {
+        json = { rawText: text };
+    }
+
+    if (!response.ok) {
+        const errorMessage = json?.errors
+            ? json.errors.map(err => `${err.code || "ERROR"}: ${err.detail || err.field || ""}`).join(" | ")
+            : `Square request failed with status ${response.status}`;
+
+        const error = new Error(errorMessage);
+        error.squareResponse = json;
+        error.status = response.status;
+        throw error;
+    }
+
+    return json;
+}
+
+async function getProcessorCatalogMapRecords() {
+    return await processorCatalogMapTable.selectRecordsAsync({
+        fields: [
+            PCM_CATALOG_MAP_ID,
+            PCM_ITEM,
+            PCM_CATALOG_PROCESSOR,
+            PCM_PROCESSOR_SKU,
+            PCM_PROCESSOR_ITEM_NAME,
+            PCM_PROCESSOR_VARIATION_NAME,
+            PCM_PROCESSOR_UNIT_PRICE,
+            PCM_PROCESSOR_CATEGORY,
+            PCM_PROCESSOR_PARENT_CATEGORY,
+            PCM_PROCESSOR_ITEM_ID,
+            PCM_PROCESSOR_VARIATION_ID,
+            PCM_PROCESSOR_CATALOG_OBJECT_ID,
+            PCM_PROCESSOR_ENVIRONMENT,
+            PCM_SYNC_TO_PROCESSOR,
+            PCM_SYNC_STATUS,
+            PCM_LAST_SYNC_AT,
+            PCM_PROCESSOR_CATALOG_VERSION,
+            PCM_SYNC_ERROR,
+            PCM_RAW_SYNC_RESPONSE
+        ]
+    });
+}
+
+async function getItemLibraryRecords() {
+    return await itemLibraryTable.selectRecordsAsync({
+        fields: [
+            ITEM_SKU,
+            ITEM_ITEM_NAME,
+            ITEM_VARIANT_NAME,
+            ITEM_BARCODE_VALUE,
+            ITEM_UNIT_PRICE,
+            ITEM_ACTIVE
+        ]
+    });
+}
+
+async function getProcessorCategoryMapRecords() {
+    return await processorCategoryMapTable.selectRecordsAsync({
+        fields: [
+            CAT_CATEGORY_MAP_ID,
+            CAT_CATALOG_PROCESSOR,
+            CAT_PROCESSOR_ENVIRONMENT,
+            CAT_AIRTABLE_CATEGORY_TYPE,
+            CAT_AIRTABLE_CATEGORY_NAME,
+            CAT_PROCESSOR_CATEGORY_ID,
+            CAT_PROCESSOR_CATEGORY_NAME,
+            CAT_PROCESSOR_CATEGORY_VERSION,
+            CAT_PARENT_CATEGORY_MAP,
+            CAT_SUBCATEGORY_MAPS,
+            CAT_SYNC_STATUS
+        ]
+    });
+}
+
+function isSquareProductionSyncCandidate(record) {
+    return (
+        getSelectName(record, PCM_CATALOG_PROCESSOR) === PROCESSOR_SQUARE &&
+        getSelectName(record, PCM_PROCESSOR_ENVIRONMENT) === ENVIRONMENT_PRODUCTION &&
+        record.getCellValue(PCM_SYNC_TO_PROCESSOR) === true
+    );
+}
+
+function isReadyToSync(record) {
+    return (
+        isSquareProductionSyncCandidate(record) &&
+        getSelectName(record, PCM_SYNC_STATUS) === STATUS_READY_TO_SYNC
+    );
+}
+
+function isSynced(record) {
+    return (
+        isSquareProductionSyncCandidate(record) &&
+        getSelectName(record, PCM_SYNC_STATUS) === STATUS_SYNCED
+    );
+}
+
+function getLinkedItemRecord(catalogRecord, itemQuery) {
+    const itemIds = getLinkedRecordIds(catalogRecord, PCM_ITEM);
+
+    if (itemIds.length !== 1) {
+        return {
+            status: "needs_review",
+            message: `PROCESSOR CATALOG MAP record must have exactly one linked Item. Found ${itemIds.length}.`
+        };
+    }
+
+    const itemRecord = itemQuery.getRecord(itemIds[0]);
+
+    if (!itemRecord) {
+        return {
+            status: "needs_review",
+            message: `Linked ITEM LIBRARY record could not be found: ${itemIds[0]}`
+        };
+    }
+
+    return {
+        status: "ok",
+        itemRecord
+    };
+}
+
+function getLinkedProcessorCategoryRecord(catalogRecord, categoryQuery) {
+    const categoryIds = getLinkedRecordIds(catalogRecord, PCM_PROCESSOR_CATEGORY);
+
+    if (categoryIds.length === 0) {
+        return {
+            status: "needs_review",
+            message: "Processor Category must be linked before syncing to Square."
+        };
+    }
+
+    if (categoryIds.length > 1) {
+        return {
+            status: "needs_review",
+            message: `Processor Category must have exactly one linked category. Found ${categoryIds.length}.`
+        };
+    }
+
+    const categoryRecord = categoryQuery.getRecord(categoryIds[0]);
+
+    if (!categoryRecord) {
+        return {
+            status: "needs_review",
+            message: `Linked Processor Category record could not be found: ${categoryIds[0]}`
+        };
+    }
+
+    return {
+        status: "ok",
+        categoryRecord
+    };
+}
+
+function validateProcessorCategory(categoryRecord) {
+    const processor = getSelectName(categoryRecord, CAT_CATALOG_PROCESSOR);
+    const environment = getSelectName(categoryRecord, CAT_PROCESSOR_ENVIRONMENT);
+    const categoryId = normalizeText(categoryRecord.getCellValueAsString(CAT_PROCESSOR_CATEGORY_ID));
+    const categoryName =
+        normalizeText(categoryRecord.getCellValueAsString(CAT_PROCESSOR_CATEGORY_NAME)) ||
+        normalizeText(categoryRecord.getCellValueAsString(CAT_AIRTABLE_CATEGORY_NAME));
+
+    if (processor !== PROCESSOR_SQUARE) {
+        throw new Error(`Linked Processor Category "${categoryName || categoryRecord.name}" must be ${PROCESSOR_SQUARE}; found "${processor || "blank"}".`);
+    }
+
+    if (environment !== ENVIRONMENT_PRODUCTION) {
+        throw new Error(`Linked Processor Category "${categoryName || categoryRecord.name}" must be ${ENVIRONMENT_PRODUCTION}; found "${environment || "blank"}".`);
+    }
+
+    if (!categoryId) {
+        throw new Error(`Processor Category "${categoryName || categoryRecord.name}" must be synced by CAT-0 before item sync. Processor Category ID is blank.`);
+    }
+
+    return {
+        categoryId,
+        categoryName
+    };
+}
+
+function buildRecordPayload(catalogRecord, itemRecord, categoryRecord) {
+    const categoryInfo = validateProcessorCategory(categoryRecord);
+
+    const processorSku = normalizeText(catalogRecord.getCellValueAsString(PCM_PROCESSOR_SKU));
+    const itemSku = normalizeText(itemRecord.getCellValueAsString(ITEM_SKU));
+
+    const processorItemName = normalizeText(catalogRecord.getCellValueAsString(PCM_PROCESSOR_ITEM_NAME));
+    const itemLibraryItemName = normalizeText(itemRecord.getCellValueAsString(ITEM_ITEM_NAME));
+
+    const processorVariationName = normalizeText(catalogRecord.getCellValueAsString(PCM_PROCESSOR_VARIATION_NAME));
+    const itemLibraryVariationName = normalizeText(itemRecord.getCellValueAsString(ITEM_VARIANT_NAME));
+
+    const processorUnitPrice = catalogRecord.getCellValue(PCM_PROCESSOR_UNIT_PRICE);
+    const itemLibraryUnitPrice = itemRecord.getCellValue(ITEM_UNIT_PRICE);
+
+    const sku = processorSku || itemSku;
+    const itemName = processorItemName || itemLibraryItemName;
+    const variationName = processorVariationName || itemLibraryVariationName || "Regular";
+    const unitPrice = processorUnitPrice !== null && processorUnitPrice !== undefined
+        ? processorUnitPrice
+        : itemLibraryUnitPrice;
+
+    const priceAmount = dollarsToCents(unitPrice);
+
+    if (!sku) {
+        return {
+            status: "needs_review",
+            message: "Processor SKU is blank and linked ITEM LIBRARY SKU is blank."
+        };
+    }
+
+    if (!itemName) {
+        return {
+            status: "needs_review",
+            message: "Processor Item Name is blank and linked ITEM LIBRARY Item Name is blank."
+        };
+    }
+
+    if (priceAmount === null) {
+        return {
+            status: "needs_review",
+            message: "Processor Unit Price is blank/invalid and linked ITEM LIBRARY Unit Price is blank/invalid."
+        };
+    }
+
+    return {
+        status: "ok",
+        payload: {
+            recordId: catalogRecord.id,
+            sku,
+            itemName,
+            variationName,
+            priceAmount,
+            barcodeValue: normalizeText(itemRecord.getCellValueAsString(ITEM_BARCODE_VALUE)),
+            categoryRecordId: categoryRecord.id,
+            categoryId: categoryInfo.categoryId,
+            categoryName: categoryInfo.categoryName,
+            existingItemId: normalizeText(catalogRecord.getCellValueAsString(PCM_PROCESSOR_ITEM_ID)),
+            existingVariationId: normalizeText(catalogRecord.getCellValueAsString(PCM_PROCESSOR_VARIATION_ID)),
+            existingItemVersion: getNumberVersion(catalogRecord.getCellValueAsString(PCM_PROCESSOR_CATALOG_VERSION))
+        }
+    };
+}
+
+function getGroupKey(payload) {
+    return `${normalizeKey(payload.itemName)}||${payload.categoryRecordId}`;
+}
+
+async function markNeedsReview(recordId, message) {
+    await processorCatalogMapTable.updateRecordAsync(recordId, {
+        [PCM_SYNC_STATUS]: selectValue(STATUS_NEEDS_REVIEW),
+        [PCM_SYNC_ERROR]: message
+    });
+}
+
+async function markSyncErrorRecords(records, error, rawResponse = null) {
+    const errorText = error?.message || String(error);
+    const responseToSave = rawResponse || error?.squareResponse || { error: errorText };
+
+    const updates = records
+        .filter(record => getSelectName(record, PCM_SYNC_STATUS) === STATUS_READY_TO_SYNC)
+        .map(record => ({
+            id: record.id,
+            fields: {
+                [PCM_SYNC_STATUS]: selectValue(STATUS_SYNC_ERROR),
+                [PCM_SYNC_ERROR]: errorText,
+                [PCM_RAW_SYNC_RESPONSE]: safeStringify(responseToSave)
+            }
+        }));
+
+    while (updates.length > 0) {
+        await processorCatalogMapTable.updateRecordsAsync(updates.splice(0, 50));
+    }
+
+    output.set("result", "sync_error");
+    output.set("error", errorText);
+}
+
+function getReturnedItemObject(response, itemId) {
+    const objects = response.objects || [];
+    return objects.find(object => object.id === itemId && object.type === "ITEM");
+}
+
+function getReturnedVariationFromItem(itemObject, variationId) {
+    const variations = itemObject?.item_data?.variations || [];
+    return variations.find(variation => variation.id === variationId);
+}
+
+function resolveReturnedId(response, originalId) {
+    if (!originalId) return "";
+
+    if (!originalId.startsWith("#")) {
+        return originalId;
+    }
+
+    return getIdFromMappings(response.id_mappings, originalId) || originalId;
+}
+
+function buildSquareItemObjectForGroup(group) {
+    const payloads = group.payloads;
+    const first = payloads[0];
+
+    const existingItemIds = Array.from(
+        new Set(payloads.map(payload => payload.existingItemId).filter(Boolean))
+    );
+
+    if (existingItemIds.length > 1) {
+        throw new Error(`Group "${first.itemName}" has multiple Processor Item IDs: ${existingItemIds.join(", ")}.`);
+    }
+
+    const itemId = existingItemIds[0] || makeTempItemId(first.itemName, first.categoryName, first.recordId);
+
+    const existingVersions = payloads
+        .map(payload => payload.existingItemVersion)
+        .filter(value => Number.isFinite(value) && value > 0);
+
+    const itemVersion = existingVersions.length > 0 ? Math.max(...existingVersions) : null;
+
+    const seenSkus = new Set();
+    const variations = [];
+
+    for (const payload of payloads) {
+        if (seenSkus.has(payload.sku)) {
+            throw new Error(`Duplicate SKU "${payload.sku}" found in Square item group "${first.itemName}".`);
+        }
+
+        seenSkus.add(payload.sku);
+
+        const variationId = payload.existingVariationId || makeTempVariationId(payload.sku, payload.recordId);
+
+        const variationObject = {
+            id: variationId,
+            type: "ITEM_VARIATION",
+            present_at_all_locations: true,
+            item_variation_data: {
+                item_id: itemId,
+                name: payload.variationName,
+                sku: payload.sku,
+                pricing_type: "FIXED_PRICING",
+                price_money: {
+                    amount: payload.priceAmount,
+                    currency: "USD"
+                }
+            }
+        };
+
+        if (payload.barcodeValue) {
+            variationObject.item_variation_data.upc = payload.barcodeValue;
+        }
+
+        variations.push(variationObject);
+    }
+
+    const itemObject = {
+        id: itemId,
+        type: "ITEM",
+        present_at_all_locations: true,
+        item_data: {
+            name: first.itemName,
+            categories: [
+                {
+                    id: first.categoryId
+                }
+            ],
+            reporting_category: {
+                id: first.categoryId
+            },
+            variations
+        }
+    };
+
+    if (itemVersion) {
+        itemObject.version = itemVersion;
+    }
+
+    return {
+        itemObject,
+        itemId
+    };
+}
+
+function buildPayloadsForRecords(records, itemQuery, categoryQuery) {
+    const payloadsByRecordId = new Map();
+    const reviewIssues = [];
+    const syncErrors = [];
+
+    for (const record of records) {
+        const itemResult = getLinkedItemRecord(record, itemQuery);
+
+        if (itemResult.status === "needs_review") {
+            reviewIssues.push({ record, message: itemResult.message });
+            continue;
+        }
+
+        const categoryResult = getLinkedProcessorCategoryRecord(record, categoryQuery);
+
+        if (categoryResult.status === "needs_review") {
+            reviewIssues.push({ record, message: categoryResult.message });
+            continue;
+        }
+
+        try {
+            const payloadResult = buildRecordPayload(record, itemResult.itemRecord, categoryResult.categoryRecord);
+
+            if (payloadResult.status === "needs_review") {
+                reviewIssues.push({ record, message: payloadResult.message });
+                continue;
+            }
+
+            payloadsByRecordId.set(record.id, payloadResult.payload);
+        } catch (error) {
+            syncErrors.push({ record, error });
+        }
+    }
+
+    return {
+        payloadsByRecordId,
+        reviewIssues,
+        syncErrors
+    };
+}
+
+async function markInitialIssues(reviewIssues, syncErrors) {
+    for (const issue of reviewIssues) {
+        await markNeedsReview(issue.record.id, issue.message);
+    }
+
+    for (const issue of syncErrors) {
+        await processorCatalogMapTable.updateRecordAsync(issue.record.id, {
+            [PCM_SYNC_STATUS]: selectValue(STATUS_SYNC_ERROR),
+            [PCM_SYNC_ERROR]: issue.error.message || String(issue.error),
+            [PCM_RAW_SYNC_RESPONSE]: safeStringify(issue.error.squareResponse || { error: issue.error.message || String(issue.error) })
+        });
+    }
+}
+
+function buildGroups(readyPayloads, candidatePayloads) {
+    const readyGroupKeys = new Set(readyPayloads.map(getGroupKey));
+    const groupsByKey = new Map();
+
+    for (const payload of candidatePayloads) {
+        const key = getGroupKey(payload);
+
+        if (!readyGroupKeys.has(key)) {
+            continue;
+        }
+
+        if (!groupsByKey.has(key)) {
+            groupsByKey.set(key, {
+                key,
+                itemName: payload.itemName,
+                categoryRecordId: payload.categoryRecordId,
+                categoryId: payload.categoryId,
+                categoryName: payload.categoryName,
+                payloads: []
+            });
+        }
+
+        groupsByKey.get(key).payloads.push(payload);
+    }
+
+    return Array.from(groupsByKey.values());
+}
+
+async function batchUpsertSquareItems(groups) {
+    const squareObjects = [];
+    const itemIdByGroupKey = new Map();
+
+    for (const group of groups) {
+        const build = buildSquareItemObjectForGroup(group);
+        squareObjects.push(build.itemObject);
+        itemIdByGroupKey.set(group.key, build.itemId);
+    }
+
+    const requestBody = {
+        idempotency_key: `cat1-prod-batch-${Date.now()}`,
+        batches: [
+            {
+                objects: squareObjects
+            }
+        ]
+    };
+
+    const response = await squareRequest("/v2/catalog/batch-upsert", "POST", requestBody);
+
+    return {
+        response,
+        itemIdByGroupKey
+    };
+}
+
+async function markBatchSynced(groups, batchResult) {
+    const updates = [];
+    const nowIso = new Date().toISOString();
+
+    for (const group of groups) {
+        const originalItemId = batchResult.itemIdByGroupKey.get(group.key);
+        const resolvedItemId = resolveReturnedId(batchResult.response, originalItemId);
+        const returnedItemObject = getReturnedItemObject(batchResult.response, resolvedItemId);
+        const itemVersion = returnedItemObject?.version || "";
+
+        if (!resolvedItemId || resolvedItemId.startsWith("#")) {
+            throw new Error(`Square batch response did not return a real item ID for group "${group.itemName}".`);
+        }
+
+        for (const payload of group.payloads) {
+            const originalVariationId = payload.existingVariationId || makeTempVariationId(payload.sku, payload.recordId);
+            const resolvedVariationId = resolveReturnedId(batchResult.response, originalVariationId);
+            const returnedVariation = getReturnedVariationFromItem(returnedItemObject, resolvedVariationId);
+
+            if (!resolvedVariationId || resolvedVariationId.startsWith("#")) {
+                throw new Error(`Square batch response did not return a real variation ID for SKU "${payload.sku}".`);
+            }
+
+            const rawResponse = {
+                syncedAt: nowIso,
+                groupKey: group.key,
+                groupedSquareItemName: group.itemName,
+                assignedCategoryId: payload.categoryId,
+                assignedCategoryName: payload.categoryName,
+                squareItemId: resolvedItemId,
+                squareVariationId: resolvedVariationId,
+                returnedVariation: returnedVariation || null,
+                returnedItem: returnedItemObject || null,
+                fullSquareResponse: batchResult.response
+            };
+
+            updates.push({
+                id: payload.recordId,
+                fields: {
+                    [PCM_PROCESSOR_ITEM_ID]: resolvedItemId,
+                    [PCM_PROCESSOR_VARIATION_ID]: resolvedVariationId,
+                    [PCM_PROCESSOR_CATALOG_OBJECT_ID]: resolvedVariationId,
+                    [PCM_PROCESSOR_CATALOG_VERSION]: itemVersion ? String(itemVersion) : "",
+                    [PCM_SYNC_STATUS]: selectValue(STATUS_SYNCED),
+                    [PCM_LAST_SYNC_AT]: nowIso,
+                    [PCM_SYNC_ERROR]: "",
+                    [PCM_RAW_SYNC_RESPONSE]: safeStringify(rawResponse)
+                }
+            });
+        }
+    }
+
+    while (updates.length > 0) {
+        await processorCatalogMapTable.updateRecordsAsync(updates.splice(0, 50));
+    }
+
+    output.set("result", "synced");
+    output.set("syncedVariationCount", groups.reduce((sum, group) => sum + group.payloads.length, 0));
+    output.set("syncedItemGroupCount", groups.length);
+}
+
+async function main() {
+    if (!catalogMapRecordId) {
+        throw new Error("Missing required input variable: catalogMapRecordId.");
+    }
+
+    const catalogQuery = await getProcessorCatalogMapRecords();
+    const triggerRecord = catalogQuery.getRecord(catalogMapRecordId);
+
+    if (!triggerRecord) {
+        throw new Error(`Could not find triggering PROCESSOR CATALOG MAP record: ${catalogMapRecordId}`);
+    }
+
+    const itemQuery = await getItemLibraryRecords();
+    const categoryQuery = await getProcessorCategoryMapRecords();
+
+    const readyRecords = catalogQuery.records.filter(isReadyToSync);
+
+    if (readyRecords.length === 0) {
+        output.set("result", "no_ready_records");
+        output.set("message", "No PROCESSOR CATALOG MAP records are currently READY TO SYNC.");
+        return;
+    }
+
+    const candidateRecords = catalogQuery.records.filter(record => isReadyToSync(record) || isSynced(record));
+
+    const readyBuild = buildPayloadsForRecords(readyRecords, itemQuery, categoryQuery);
+
+    await markInitialIssues(readyBuild.reviewIssues, readyBuild.syncErrors);
+
+    const validReadyPayloads = Array.from(readyBuild.payloadsByRecordId.values());
+
+    if (validReadyPayloads.length === 0) {
+        output.set("result", "no_valid_ready_records");
+        output.set("message", "READY TO SYNC records were found, but none were valid for Square sync.");
+        return;
+    }
+
+    const candidateBuild = buildPayloadsForRecords(candidateRecords, itemQuery, categoryQuery);
+    const validCandidatePayloads = Array.from(candidateBuild.payloadsByRecordId.values());
+
+    const groups = buildGroups(validReadyPayloads, validCandidatePayloads);
+
+    if (groups.length === 0) {
+        output.set("result", "no_valid_groups");
+        output.set("message", "No valid Square item groups could be built.");
+        return;
+    }
+
+    try {
+        const batchResult = await batchUpsertSquareItems(groups);
+        await markBatchSynced(groups, batchResult);
+    } catch (error) {
+        const involvedRecordIds = new Set();
+
+        for (const group of groups) {
+            for (const payload of group.payloads) {
+                involvedRecordIds.add(payload.recordId);
+            }
+        }
+
+        const involvedRecords = catalogQuery.records.filter(record => involvedRecordIds.has(record.id));
+        await markSyncErrorRecords(involvedRecords, error);
+    }
+}
+
+await main();
