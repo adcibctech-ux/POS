@@ -1,5 +1,5 @@
 /***************************************************************
- * SCRIPT: CAT-1-SquareCatalogSync-v26.2.0
+ * SCRIPT: CAT-1-SquareCatalogSync-v26.2.1
  * SYSTEM: ADC|IBC POS Backend
  * TABLE(S): PROCESSOR CATALOG MAP, ITEM LIBRARY, PROCESSOR CATEGORY MAP
  *
@@ -8,14 +8,14 @@
  * variations from PROCESSOR CATALOG MAP records.
  *
  * VERSIONING:
- * CAT-1-SquareCatalogSync-v26.2.0
+ * CAT-1-SquareCatalogSync-v26.2.1
  *
  * Version format:
  * - CAT-1 = item/catalog sync workflow/script number.
  * - v26 = 2026 system standard.
  * - .2 = major structural update: single-record item sync converted to
  *        batch item/variation sync.
- * - .0 = first release of the v26.2 batch item-sync branch.
+ * - .1 = bug fixes
  *
  * SCRIPT BEHAVIOR:
  * 1. Runs when one PROCESSOR CATALOG MAP record enters the Ready for
@@ -64,6 +64,9 @@
  *    - saves Raw Sync Response if available
  *
  * UPDATES / BUG FIXES:
+ * v26.2.1
+ * - Minor text wrapping fix using trim() in input.config()
+ *
  * v26.2.0
  * - Major structural change from single-record item sync to batch item sync.
  * - Groups sibling variation records into shared Square ITEM objects.
