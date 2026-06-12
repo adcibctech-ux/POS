@@ -1,0 +1,737 @@
+/***************************************************************
+ * SCRIPT: CAT-0-SquareCategorySync-v26.1.0
+ * SYSTEM: ADC|IBC POS Backend
+ * TABLE(S): PROCESSOR CATEGORY MAP
+ *
+ * PURPOSE:
+ * Batch creates/updates Square PRODUCTION catalog categories from
+ * PROCESSOR CATEGORY MAP, including parent/subcategory hierarchy.
+ *
+ * VERSIONING:
+ * CAT-0-SquareCategorySync-v26.1.0
+ *
+ * Version format:
+ * - CAT-0 = category sync workflow/script number.
+ * - v26 = 2026 system standard.
+ * - .1 = major structural update: single-record sync converted to
+ *        batch category hierarchy sync.
+ * - .0 = first release of the v26.1 batch-sync branch.
+ *
+ * SCRIPT BEHAVIOR:
+ * 1. Runs when one category-map record enters the Ready for Category Sync view.
+ * 2. Uses that trigger as a batch kick-off.
+ * 3. Processes all eligible PROCESSOR CATEGORY MAP records where:
+ *    - Catalog Processor = SQUARE
+ *    - Processor Environment = PRODUCTION
+ *    - Sync to Processor? = checked
+ *    - Sync Status = READY TO SYNC
+ * 4. Also includes linked parent categories needed by ready sub-categories,
+ *    even if the parent is already SYNCED.
+ * 5. Uses Square batch-upsert so parent and child categories are created
+ *    together and child categories can reference parent temporary IDs.
+ * 6. Uses Parent Category Map self-link for hierarchy.
+ * 7. On success:
+ *    - writes Processor Category ID
+ *    - writes Processor Category Version
+ *    - sets Sync Status = SYNCED
+ *    - sets Last Sync At = now
+ *    - clears Sync Error
+ *    - saves Raw Sync Response
+ * 8. On failure:
+ *    - sets READY TO SYNC records to SYNC ERROR
+ *    - writes Sync Error
+ *    - saves Raw Sync Response
+ *
+ * UPDATES / BUG FIXES:
+ * v26.1.0
+ * - Major structural change from single-record category sync to batch
+ *   category sync using Square Catalog Batch Upsert.
+ * - Parent and sub-category records are now sent together in one atomic
+ *   Square request.
+ * - Sub-categories now reference parent categories using temporary
+ *   Square object IDs in the same batch, avoiding the parent-ID-not-found
+ *   error from prior single-record hierarchy attempts.
+ * - Added support for Airtable self-linked hierarchy:
+ *     PROCESSOR CATEGORY MAP → Parent Category Map / Subcategory Maps.
+ * - Triggering record is now used only as the batch kickoff; the script
+ *   processes all eligible READY TO SYNC category records.
+ * - Script also includes parent categories required by READY TO SYNC
+ *   sub-categories, even if the parent category was already marked SYNCED.
+ *
+ * v26.0.2
+ * - Fixed Square IDEMPOTENCY_KEY_REUSED errors on category creation.
+ * - Category create idempotency key was updated to include Date.now().
+ *
+ * v26.0.1
+ * - Added attempted Square category hierarchy support for sub-categories
+ *   in single-record sync mode.
+ * - Attempted to attach sub-categories to synced parent Square category IDs.
+ * - Exposed Square parent-ID-not-found issue when creating children after
+ *   parents in separate requests.
+ *
+ * v26.0.0
+ * - Initial production Square category sync release.
+ * - Created/updated one flat Square CATEGORY object from one triggering
+ *   PROCESSOR CATEGORY MAP record.
+ *
+ * IMPORTANT:
+ * - Processor Category Name is a formula field.
+ * - This script reads Processor Category Name but does not write to it.
+ * - If Processor Category Name is blank, it falls back to Airtable Category Name.
+ * - Parent/sub-category hierarchy comes from Parent Category Map, not from
+ *   ITEM LIBRARY inference.
+ * - Because this is batch mode, one trigger can sync multiple category-map
+ *   records at once.
+ *
+ * REQUIRED AIRTABLE AUTOMATION INPUTS:
+ * - categoryMapRecordId
+ *
+ * REQUIRED AIRTABLE SECRET:
+ * - SQUARE_PRODUCTION_ACCESS_TOKEN
+ ***************************************************************/
+
+const config = input.config();
+
+const categoryMapRecordId = config.categoryMapRecordId;
+
+const SQUARE_VERSION = "2026-05-20";
+
+const SQUARE_BASE_URL = "https://connect.squareup.com";
+
+const SQUARE_ACCESS_TOKEN = input.secret("SQUARE_PRODUCTION_ACCESS_TOKEN");
+
+const CATEGORY_MAP_TABLE_ID = "tblQeN0UiqavIxdZQ";
+
+// PROCESSOR CATEGORY MAP fields
+
+const CAT_CATEGORY_MAP_ID = "Category Map ID";
+
+const CAT_CATALOG_PROCESSOR = "Catalog Processor";
+
+const CAT_PROCESSOR_ENVIRONMENT = "Processor Environment";
+
+const CAT_AIRTABLE_CATEGORY_TYPE = "Airtable Category Type";
+
+const CAT_AIRTABLE_CATEGORY_NAME = "Airtable Category Name";
+
+const CAT_PROCESSOR_CATEGORY_ID = "Processor Category ID";
+
+const CAT_PROCESSOR_CATEGORY_NAME = "Processor Category Name";
+
+const CAT_PROCESSOR_CATEGORY_VERSION = "Processor Category Version";
+
+const CAT_PARENT_CATEGORY_MAP = "Parent Category Map";
+
+const CAT_SUBCATEGORY_MAPS = "Subcategory Maps";
+
+const CAT_SYNC_TO_PROCESSOR = "Sync to Processor?";
+
+const CAT_SYNC_STATUS = "Sync Status";
+
+const CAT_LAST_SYNC_AT = "Last Sync At";
+
+const CAT_SYNC_ERROR = "Sync Error";
+
+const CAT_RAW_SYNC_RESPONSE = "Raw Sync Response";
+
+const CAT_NOTES = "Notes";
+
+// Select option values
+
+const PROCESSOR_SQUARE = "SQUARE";
+
+const ENVIRONMENT_PRODUCTION = "PRODUCTION";
+
+const TYPE_PARENT_CATEGORY = "PARENT CATEGORY";
+
+const TYPE_SUB_CATEGORY = "SUB-CATEGORY";
+
+const STATUS_READY_TO_SYNC = "READY TO SYNC";
+
+const STATUS_SYNCED = "SYNCED";
+
+const STATUS_SYNC_ERROR = "SYNC ERROR";
+
+const categoryMapTable = base.getTable(CATEGORY_MAP_TABLE_ID);
+
+function selectValue(name) {
+
+    return { name };
+
+}
+
+function getSelectName(record, fieldName) {
+
+    return record.getCellValue(fieldName)?.name || "";
+
+}
+
+function normalizeText(value) {
+
+    if (value === null || value === undefined) return "";
+
+    return String(value).trim();
+
+}
+
+function normalizeKey(value) {
+
+    return normalizeText(value).toLowerCase();
+
+}
+
+function safeStringify(value) {
+
+    try {
+
+        return JSON.stringify(value, null, 2);
+
+    } catch (error) {
+
+        return String(value);
+
+    }
+
+}
+
+function makeSafeSlug(value) {
+
+    return normalizeText(value)
+
+        .toUpperCase()
+
+        .replace(/[^A-Z0-9]+/g, "-")
+
+        .replace(/^-+|-+$/g, "")
+
+        .slice(0, 60);
+
+}
+
+function makeTempCategoryId(record) {
+
+    const categoryName =
+
+        normalizeText(record.getCellValueAsString(CAT_PROCESSOR_CATEGORY_NAME)) ||
+
+        normalizeText(record.getCellValueAsString(CAT_AIRTABLE_CATEGORY_NAME)) ||
+
+        record.id;
+
+    return `#CATEGORY-${makeSafeSlug(categoryName) || record.id}`;
+
+}
+
+function getCategoryDisplayName(record) {
+
+    return (
+
+        normalizeText(record.getCellValueAsString(CAT_PROCESSOR_CATEGORY_NAME)) ||
+
+        normalizeText(record.getCellValueAsString(CAT_AIRTABLE_CATEGORY_NAME))
+
+    );
+
+}
+
+function getLinkedRecordIds(record, fieldName) {
+
+    const links = record.getCellValue(fieldName) || [];
+
+    return links.map(link => link.id);
+
+}
+
+function isSquareProduction(record) {
+
+    return (
+
+        getSelectName(record, CAT_CATALOG_PROCESSOR) === PROCESSOR_SQUARE &&
+
+        getSelectName(record, CAT_PROCESSOR_ENVIRONMENT) === ENVIRONMENT_PRODUCTION
+
+    );
+
+}
+
+function isReadyToSync(record) {
+
+    return (
+
+        isSquareProduction(record) &&
+
+        record.getCellValue(CAT_SYNC_TO_PROCESSOR) === true &&
+
+        getSelectName(record, CAT_SYNC_STATUS) === STATUS_READY_TO_SYNC
+
+    );
+
+}
+
+function isParentCategory(record) {
+
+    return getSelectName(record, CAT_AIRTABLE_CATEGORY_TYPE) === TYPE_PARENT_CATEGORY;
+
+}
+
+function isSubCategory(record) {
+
+    return getSelectName(record, CAT_AIRTABLE_CATEGORY_TYPE) === TYPE_SUB_CATEGORY;
+
+}
+
+function validateCategoryRecord(record) {
+
+    const categoryName = getCategoryDisplayName(record);
+
+    const categoryType = getSelectName(record, CAT_AIRTABLE_CATEGORY_TYPE);
+
+    if (!isSquareProduction(record)) {
+
+        throw new Error(`${record.name}: must be SQUARE / PRODUCTION.`);
+
+    }
+
+    if (record.getCellValue(CAT_SYNC_TO_PROCESSOR) !== true) {
+
+        throw new Error(`${record.name}: Sync to Processor? must be checked.`);
+
+    }
+
+    if (!categoryName) {
+
+        throw new Error(`${record.name}: Processor Category Name and Airtable Category Name are both blank.`);
+
+    }
+
+    if (![TYPE_PARENT_CATEGORY, TYPE_SUB_CATEGORY].includes(categoryType)) {
+
+        throw new Error(`${record.name}: Airtable Category Type must be PARENT CATEGORY or SUB-CATEGORY.`);
+
+    }
+
+    if (isSubCategory(record)) {
+
+        const parentIds = getLinkedRecordIds(record, CAT_PARENT_CATEGORY_MAP);
+
+        if (parentIds.length !== 1) {
+
+            throw new Error(`${record.name}: SUB-CATEGORY records must have exactly one Parent Category Map.`);
+
+        }
+
+    }
+
+}
+
+async function squareRequest(path, method, body) {
+
+    const response = await fetch(`${SQUARE_BASE_URL}${path}`, {
+
+        method,
+
+        headers: {
+
+            "Square-Version": SQUARE_VERSION,
+
+            "Authorization": `Bearer ${SQUARE_ACCESS_TOKEN}`,
+
+            "Content-Type": "application/json"
+
+        },
+
+        body: body ? JSON.stringify(body) : undefined
+
+    });
+
+    const text = await response.text();
+
+    let json;
+
+    try {
+
+        json = text ? JSON.parse(text) : {};
+
+    } catch (error) {
+
+        json = { rawText: text };
+
+    }
+
+    if (!response.ok) {
+
+        const errorMessage = json?.errors
+
+            ? json.errors.map(err => `${err.code || "ERROR"}: ${err.detail || err.field || ""}`).join(" | ")
+
+            : `Square request failed with status ${response.status}`;
+
+        const error = new Error(errorMessage);
+
+        error.squareResponse = json;
+
+        error.status = response.status;
+
+        throw error;
+
+    }
+
+    return json;
+
+}
+
+async function getCategoryMapRecords() {
+
+    return await categoryMapTable.selectRecordsAsync({
+
+        fields: [
+
+            CAT_CATEGORY_MAP_ID,
+
+            CAT_CATALOG_PROCESSOR,
+
+            CAT_PROCESSOR_ENVIRONMENT,
+
+            CAT_AIRTABLE_CATEGORY_TYPE,
+
+            CAT_AIRTABLE_CATEGORY_NAME,
+
+            CAT_PROCESSOR_CATEGORY_ID,
+
+            CAT_PROCESSOR_CATEGORY_NAME,
+
+            CAT_PROCESSOR_CATEGORY_VERSION,
+
+            CAT_PARENT_CATEGORY_MAP,
+
+            CAT_SUBCATEGORY_MAPS,
+
+            CAT_SYNC_TO_PROCESSOR,
+
+            CAT_SYNC_STATUS,
+
+            CAT_LAST_SYNC_AT,
+
+            CAT_SYNC_ERROR,
+
+            CAT_RAW_SYNC_RESPONSE,
+
+            CAT_NOTES
+
+        ]
+
+    });
+
+}
+
+function collectBatchRecords(query) {
+
+    const byId = new Map(query.records.map(record => [record.id, record]));
+
+    const readyRecords = query.records.filter(isReadyToSync);
+
+    if (readyRecords.length === 0) {
+
+        throw new Error("No PROCESSOR CATEGORY MAP records are currently READY TO SYNC.");
+
+    }
+
+    const includeIds = new Set();
+
+    for (const record of readyRecords) {
+
+        includeIds.add(record.id);
+
+        if (isSubCategory(record)) {
+
+            const parentIds = getLinkedRecordIds(record, CAT_PARENT_CATEGORY_MAP);
+
+            for (const parentId of parentIds) {
+
+                includeIds.add(parentId);
+
+            }
+
+        }
+
+    }
+
+    const includedRecords = Array.from(includeIds).map(id => byId.get(id)).filter(Boolean);
+
+    for (const record of includedRecords) {
+
+        validateCategoryRecord(record);
+
+    }
+
+    const parents = includedRecords
+
+        .filter(isParentCategory)
+
+        .sort((a, b) => getCategoryDisplayName(a).localeCompare(getCategoryDisplayName(b)));
+
+    const children = includedRecords
+
+        .filter(isSubCategory)
+
+        .sort((a, b) => getCategoryDisplayName(a).localeCompare(getCategoryDisplayName(b)));
+
+    return {
+
+        readyRecords,
+
+        includedRecords,
+
+        parents,
+
+        children,
+
+        byId
+
+    };
+
+}
+
+function buildSquareObject(record, tempIdByRecordId) {
+
+    const categoryName = getCategoryDisplayName(record);
+
+    const categoryData = {
+
+        name: categoryName
+
+    };
+
+    if (isSubCategory(record)) {
+
+        const parentId = getLinkedRecordIds(record, CAT_PARENT_CATEGORY_MAP)[0];
+
+        const parentTempId = tempIdByRecordId.get(parentId);
+
+        if (!parentTempId) {
+
+            throw new Error(`${record.name}: parent category was not included in batch.`);
+
+        }
+
+        categoryData.parent_category = {
+
+            id: parentTempId
+
+        };
+
+    }
+
+    return {
+
+        type: "CATEGORY",
+
+        id: tempIdByRecordId.get(record.id),
+
+        present_at_all_locations: true,
+
+        category_data: categoryData
+
+    };
+
+}
+
+function getIdMapping(response, tempId) {
+
+    const mappings = response.id_mappings || [];
+
+    return mappings.find(mapping => mapping.client_object_id === tempId || mapping.clientObjectId === tempId);
+
+}
+
+function getReturnedObject(response, objectId) {
+
+    const objects = response.objects || [];
+
+    return objects.find(object => object.id === objectId);
+
+}
+
+async function markBatchError(records, error) {
+
+    const errorText = error?.message || String(error);
+
+    const responseToSave = error?.squareResponse || { error: errorText };
+
+    const updates = records
+
+        .filter(record => getSelectName(record, CAT_SYNC_STATUS) === STATUS_READY_TO_SYNC)
+
+        .map(record => ({
+
+            id: record.id,
+
+            fields: {
+
+                [CAT_SYNC_STATUS]: selectValue(STATUS_SYNC_ERROR),
+
+                [CAT_SYNC_ERROR]: errorText,
+
+                [CAT_RAW_SYNC_RESPONSE]: safeStringify(responseToSave)
+
+            }
+
+        }));
+
+    while (updates.length > 0) {
+
+        await categoryMapTable.updateRecordsAsync(updates.splice(0, 50));
+
+    }
+
+    output.set("result", "sync_error");
+
+    output.set("error", errorText);
+
+}
+
+async function markBatchSynced(records, tempIdByRecordId, response) {
+
+    const updates = [];
+
+    for (const record of records) {
+
+        const tempId = tempIdByRecordId.get(record.id);
+
+        const mapping = getIdMapping(response, tempId);
+
+        const squareId = mapping?.object_id || mapping?.objectId;
+
+        if (!squareId) {
+
+            throw new Error(`${record.name}: Square batch response did not return an ID mapping for ${tempId}.`);
+
+        }
+
+        const returnedObject = getReturnedObject(response, squareId);
+
+        const version = returnedObject?.version || "";
+
+        const rawResponse = {
+
+            batchSyncedAt: new Date().toISOString(),
+
+            tempCategoryId: tempId,
+
+            squareCategoryId: squareId,
+
+            returnedObject: returnedObject || null,
+
+            fullSquareResponse: response
+
+        };
+
+        updates.push({
+
+            id: record.id,
+
+            fields: {
+
+                [CAT_PROCESSOR_CATEGORY_ID]: squareId,
+
+                [CAT_PROCESSOR_CATEGORY_VERSION]: version ? String(version) : "",
+
+                [CAT_SYNC_STATUS]: selectValue(STATUS_SYNCED),
+
+                [CAT_LAST_SYNC_AT]: new Date().toISOString(),
+
+                [CAT_SYNC_ERROR]: "",
+
+                [CAT_RAW_SYNC_RESPONSE]: safeStringify(rawResponse)
+
+            }
+
+        });
+
+    }
+
+    while (updates.length > 0) {
+
+        await categoryMapTable.updateRecordsAsync(updates.splice(0, 50));
+
+    }
+
+    output.set("result", "synced");
+
+    output.set("syncedCategoryCount", records.length);
+
+}
+
+async function main() {
+
+    if (!categoryMapRecordId) {
+
+        throw new Error("Missing required input variable: categoryMapRecordId.");
+
+    }
+
+    const query = await getCategoryMapRecords();
+
+    const triggerRecord = query.getRecord(categoryMapRecordId);
+
+    if (!triggerRecord) {
+
+        throw new Error(`Could not find triggering category map record: ${categoryMapRecordId}`);
+
+    }
+
+    const {
+
+        readyRecords,
+
+        includedRecords,
+
+        parents,
+
+        children
+
+    } = collectBatchRecords(query);
+
+    const orderedRecords = [...parents, ...children];
+
+    const tempIdByRecordId = new Map();
+
+    for (const record of orderedRecords) {
+
+        tempIdByRecordId.set(record.id, makeTempCategoryId(record));
+
+    }
+
+    const squareObjects = orderedRecords.map(record => buildSquareObject(record, tempIdByRecordId));
+
+    const requestBody = {
+
+        idempotency_key: `cat0-prod-batch-${Date.now()}`,
+
+        batches: [
+
+            {
+
+                objects: squareObjects
+
+            }
+
+        ]
+
+    };
+
+    try {
+
+        const response = await squareRequest("/v2/catalog/batch-upsert", "POST", requestBody);
+
+        await markBatchSynced(orderedRecords, tempIdByRecordId, response);
+
+    } catch (error) {
+
+        await markBatchError(readyRecords, error);
+
+    }
+
+}
+
+await main();
