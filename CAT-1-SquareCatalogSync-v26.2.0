@@ -105,7 +105,7 @@
  ***************************************************************/
 
 const config = input.config();
-const catalogMapRecordId = config.catalogMapRecordId;
+const catalogMapRecordId = String(config.catalogMapRecordId || "").trim();
 
 const SQUARE_VERSION = "2026-05-20";
 const SQUARE_BASE_URL = "https://connect.squareup.com";
