@@ -1,0 +1,555 @@
+/***************************************************************
+ * SCRIPT: CAT-2-SquareImageSync-v26.0.0
+ * SYSTEM: ADC|IBC POS Backend
+ * TABLE(S): PROCESSOR CATALOG MAP
+ *
+ * PURPOSE:
+ * Uploads product images from Airtable PROCESSOR CATALOG MAP to
+ * existing Square PRODUCTION catalog item variations.
+ *
+ * VERSIONING:
+ * CAT-2-SquareImageSync-v26.0.0
+ *
+ * Version format:
+ * - CAT-2 = image sync workflow/script number.
+ * - v26 = 2026 system standard.
+ * - .0 = first CAT-2 image sync release branch.
+ * - .0 = first release of this branch.
+ *
+ * SCRIPT BEHAVIOR:
+ * 1. Runs when one PROCESSOR CATALOG MAP record enters the Ready for
+ *    Image Sync view.
+ * 2. Uses that trigger as a batch kick-off.
+ * 3. Processes all eligible PROCESSOR CATALOG MAP records where:
+ *    - Image Sync to Processor? = checked
+ *    - Image Sync Status = READY TO SYNC
+ * 4. Requires each READY TO SYNC image record to have:
+ *    - Processor Variation ID
+ *    - Image Group Key
+ * 5. Finds the source image from:
+ *    - Product Images on the same record, OR
+ *    - Product Images on another record with the same Image Group Key.
+ * 6. Uploads one Square image per READY TO SYNC variation record.
+ * 7. Attaches each uploaded image to that record's Processor Variation ID.
+ * 8. Sets is_primary = true for the variation image upload.
+ * 9. If Processor Image ID already exists:
+ *    - deletes the existing Square CatalogImage object first.
+ *    - uploads the new image after deletion.
+ * 10. On success:
+ *    - writes Processor Image ID
+ *    - sets Image Sync Status = SYNCED
+ *    - sets Last Image Sync At = now
+ *    - clears Image Sync Error
+ *    - saves Raw Image Sync Response
+ * 11. On review issue:
+ *    - sets Image Sync Status = NEEDS REVIEW
+ *    - writes Image Sync Error
+ * 12. On sync failure:
+ *    - sets Image Sync Status = SYNC ERROR
+ *    - writes Image Sync Error
+ *    - saves Raw Image Sync Response if available
+ *
+ * UPDATES / BUG FIXES:
+ * v26.0.0
+ * - Initial Square image sync release.
+ * - Adds image upload support using Square CreateCatalogImage endpoint.
+ * - Supports re-upload by deleting existing Processor Image ID before
+ *   uploading a new image.
+ * - Uses Image Group Key to share one source image across related
+ *   color/size variants.
+ * - Uploads the source image separately for each variation so each
+ *   variation can have its own attached primary Square image.
+ *
+ * IMPORTANT:
+ * - CAT-1 must successfully sync catalog items before CAT-2 image sync.
+ * - Processor Variation ID is required because images are attached to
+ *   Square item variations, not only the shared parent item.
+ * - Product Images is an Airtable attachment field.
+ * - Image Group Key should group size variants that share the same
+ *   color/product image.
+ * - This script does not alter normal catalog/item sync fields.
+ *
+ * REQUIRED AIRTABLE AUTOMATION INPUTS:
+ * - catalogMapRecordId
+ *
+ * REQUIRED AIRTABLE SECRET:
+ * - SQUARE_PRODUCTION_ACCESS_TOKEN
+ ***************************************************************/
+
+const config = input.config();
+const catalogMapRecordId = String(config.catalogMapRecordId || "").trim();
+
+const SQUARE_VERSION = "2026-05-20";
+const SQUARE_BASE_URL = "https://connect.squareup.com";
+const SQUARE_ACCESS_TOKEN = input.secret("SQUARE_PRODUCTION_ACCESS_TOKEN");
+
+const PROCESSOR_CATALOG_MAP_TABLE_ID = "tbliIMV8WXiUCmpWd";
+
+// Existing PROCESSOR CATALOG MAP fields
+const PCM_CATALOG_MAP_ID = "Catalog Map ID";
+const PCM_PROCESSOR_SKU = "Processor SKU";
+const PCM_PROCESSOR_ITEM_NAME = "Processor Item Name";
+const PCM_PROCESSOR_VARIATION_NAME = "Processor Variation Name";
+const PCM_PROCESSOR_ITEM_ID = "Processor Item ID";
+const PCM_PROCESSOR_VARIATION_ID = "Processor Variation ID";
+const PCM_PROCESSOR_CATALOG_OBJECT_ID = "Processor Catalog Object ID";
+
+// Image sync fields
+const IMG_PRODUCT_IMAGES = "Product Images";
+const IMG_IMAGE_GROUP_KEY = "Image Group Key";
+const IMG_SYNC_TO_PROCESSOR = "Image Sync to Processor?";
+const IMG_SYNC_STATUS = "Image Sync Status";
+const IMG_LAST_SYNC_AT = "Last Image Sync At";
+const IMG_PROCESSOR_IMAGE_ID = "Processor Image ID";
+const IMG_SYNC_ERROR = "Image Sync Error";
+const IMG_RAW_SYNC_RESPONSE = "Raw Image Sync Response";
+
+// Image sync status values
+const STATUS_READY_TO_SYNC = "READY TO SYNC";
+const STATUS_SYNCED = "SYNCED";
+const STATUS_SYNC_ERROR = "SYNC ERROR";
+const STATUS_NEEDS_REVIEW = "NEEDS REVIEW";
+
+const processorCatalogMapTable = base.getTable(PROCESSOR_CATALOG_MAP_TABLE_ID);
+
+function selectValue(name) {
+    return { name };
+}
+
+function normalizeText(value) {
+    if (value === null || value === undefined) return "";
+    return String(value).trim();
+}
+
+function normalizeKey(value) {
+    return normalizeText(value).toLowerCase();
+}
+
+function getSelectName(record, fieldName) {
+    return record.getCellValue(fieldName)?.name || "";
+}
+
+function safeStringify(value) {
+    try {
+        return JSON.stringify(value, null, 2);
+    } catch (error) {
+        return String(value);
+    }
+}
+
+function makeSafeSlug(value) {
+    return normalizeText(value)
+        .toUpperCase()
+        .replace(/[^A-Z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 60);
+}
+
+function getAttachments(record, fieldName) {
+    return record.getCellValue(fieldName) || [];
+}
+
+function getFirstAttachment(record, fieldName) {
+    const attachments = getAttachments(record, fieldName);
+    return attachments.length > 0 ? attachments[0] : null;
+}
+
+function getImageGroupKey(record) {
+    return normalizeText(record.getCellValueAsString(IMG_IMAGE_GROUP_KEY));
+}
+
+function getProcessorImageIds(record) {
+    const raw = normalizeText(record.getCellValueAsString(IMG_PROCESSOR_IMAGE_ID));
+
+    if (!raw) {
+        return [];
+    }
+
+    return raw
+        .split(/[,\n]+/)
+        .map(value => normalizeText(value))
+        .filter(Boolean);
+}
+
+function getDisplaySku(record) {
+    return normalizeText(record.getCellValueAsString(PCM_PROCESSOR_SKU)) || record.id;
+}
+
+function getImageName(record, attachment) {
+    const sku = getDisplaySku(record);
+    const attachmentName = normalizeText(attachment?.filename);
+    const baseName = attachmentName || `${sku}-image`;
+
+    return `${sku} | ${baseName}`;
+}
+
+function makeTempImageId(record, attachment) {
+    const sku = getDisplaySku(record);
+    const attachmentName = normalizeText(attachment?.filename);
+    const safeBase = makeSafeSlug(`${sku}-${attachmentName || "IMAGE"}`);
+
+    return `#IMAGE-${safeBase || record.id}`;
+}
+
+function isImageSyncReady(record) {
+    return (
+        record.getCellValue(IMG_SYNC_TO_PROCESSOR) === true &&
+        getSelectName(record, IMG_SYNC_STATUS) === STATUS_READY_TO_SYNC
+    );
+}
+
+function isImageCandidate(record) {
+    return (
+        record.getCellValue(IMG_SYNC_TO_PROCESSOR) === true &&
+        Boolean(getImageGroupKey(record))
+    );
+}
+
+function validateReadyRecord(record) {
+    const variationId = normalizeText(record.getCellValueAsString(PCM_PROCESSOR_VARIATION_ID));
+    const imageGroupKey = getImageGroupKey(record);
+
+    if (!variationId) {
+        return {
+            status: "needs_review",
+            message: "Processor Variation ID is required before image sync. Run CAT-1 first."
+        };
+    }
+
+    if (!imageGroupKey) {
+        return {
+            status: "needs_review",
+            message: "Image Group Key is required before image sync."
+        };
+    }
+
+    return {
+        status: "ok"
+    };
+}
+
+function findSourceImageForGroup(readyRecord, allRecords) {
+    const groupKey = normalizeKey(getImageGroupKey(readyRecord));
+
+    const sameRecordAttachment = getFirstAttachment(readyRecord, IMG_PRODUCT_IMAGES);
+    if (sameRecordAttachment) {
+        return {
+            sourceRecord: readyRecord,
+            attachment: sameRecordAttachment,
+            sourceType: "same_record"
+        };
+    }
+
+    const groupRecords = allRecords.filter(record =>
+        normalizeKey(getImageGroupKey(record)) === groupKey
+    );
+
+    for (const groupRecord of groupRecords) {
+        const attachment = getFirstAttachment(groupRecord, IMG_PRODUCT_IMAGES);
+
+        if (attachment) {
+            return {
+                sourceRecord: groupRecord,
+                attachment,
+                sourceType: "same_image_group"
+            };
+        }
+    }
+
+    return {
+        sourceRecord: null,
+        attachment: null,
+        sourceType: "none"
+    };
+}
+
+async function squareJsonRequest(path, method, body = null) {
+    const response = await fetch(`${SQUARE_BASE_URL}${path}`, {
+        method,
+        headers: {
+            "Square-Version": SQUARE_VERSION,
+            "Authorization": `Bearer ${SQUARE_ACCESS_TOKEN}`,
+            "Content-Type": "application/json"
+        },
+        body: body ? JSON.stringify(body) : undefined
+    });
+
+    const text = await response.text();
+    let json;
+
+    try {
+        json = text ? JSON.parse(text) : {};
+    } catch (error) {
+        json = { rawText: text };
+    }
+
+    if (!response.ok) {
+        const errorMessage = json?.errors
+            ? json.errors.map(err => `${err.code || "ERROR"}: ${err.detail || err.field || ""}`).join(" | ")
+            : `Square request failed with status ${response.status}`;
+
+        const error = new Error(errorMessage);
+        error.squareResponse = json;
+        error.status = response.status;
+        throw error;
+    }
+
+    return json;
+}
+
+async function fetchAttachmentBlob(attachment) {
+    const response = await fetch(attachment.url);
+
+    if (!response.ok) {
+        throw new Error(`Could not fetch Airtable attachment "${attachment.filename}". HTTP ${response.status}.`);
+    }
+
+    return await response.blob();
+}
+
+async function deleteSquareImage(imageId) {
+    return await squareJsonRequest(
+        `/v2/catalog/object/${encodeURIComponent(imageId)}`,
+        "DELETE"
+    );
+}
+
+async function createSquareImageForVariation(record, sourceRecord, attachment) {
+    const variationId = normalizeText(record.getCellValueAsString(PCM_PROCESSOR_VARIATION_ID));
+    const sku = getDisplaySku(record);
+    const tempImageId = makeTempImageId(record, attachment);
+
+    const imageBlob = await fetchAttachmentBlob(attachment);
+
+    const requestPayload = {
+        idempotency_key: `cat2-prod-image-${record.id}-${Date.now()}`,
+        object_id: variationId,
+        is_primary: true,
+        image: {
+            id: tempImageId,
+            type: "IMAGE",
+            image_data: {
+                name: getImageName(record, attachment),
+                caption: `Image for ${sku}`
+            }
+        }
+    };
+
+    const formData = new FormData();
+    formData.append("request", JSON.stringify(requestPayload));
+    formData.append(
+        "image_file",
+        imageBlob,
+        attachment.filename || `${sku}.jpg`
+    );
+
+    const response = await fetch(`${SQUARE_BASE_URL}/v2/catalog/images`, {
+        method: "POST",
+        headers: {
+            "Square-Version": SQUARE_VERSION,
+            "Authorization": `Bearer ${SQUARE_ACCESS_TOKEN}`
+        },
+        body: formData
+    });
+
+    const text = await response.text();
+    let json;
+
+    try {
+        json = text ? JSON.parse(text) : {};
+    } catch (error) {
+        json = { rawText: text };
+    }
+
+    if (!response.ok) {
+        const errorMessage = json?.errors
+            ? json.errors.map(err => `${err.code || "ERROR"}: ${err.detail || err.field || ""}`).join(" | ")
+            : `Square image upload failed with status ${response.status}`;
+
+        const error = new Error(errorMessage);
+        error.squareResponse = json;
+        error.status = response.status;
+        throw error;
+    }
+
+    const imageId = json.image?.id || json.catalog_object?.id || json.catalogObject?.id;
+
+    if (!imageId) {
+        throw new Error("Square image upload succeeded but returned no image ID.");
+    }
+
+    return {
+        response: json,
+        imageId,
+        requestPayload,
+        sourceRecordId: sourceRecord.id,
+        sourceAttachmentFileName: attachment.filename || ""
+    };
+}
+
+async function markNeedsReview(record, message) {
+    await processorCatalogMapTable.updateRecordAsync(record.id, {
+        [IMG_SYNC_STATUS]: selectValue(STATUS_NEEDS_REVIEW),
+        [IMG_SYNC_ERROR]: message
+    });
+
+    output.set("lastNeedsReviewRecordId", record.id);
+}
+
+async function markSyncError(record, error, rawResponse = null) {
+    const errorText = error?.message || String(error);
+    const responseToSave = rawResponse || error?.squareResponse || { error: errorText };
+
+    await processorCatalogMapTable.updateRecordAsync(record.id, {
+        [IMG_SYNC_STATUS]: selectValue(STATUS_SYNC_ERROR),
+        [IMG_SYNC_ERROR]: errorText,
+        [IMG_RAW_SYNC_RESPONSE]: safeStringify(responseToSave)
+    });
+
+    output.set("lastSyncErrorRecordId", record.id);
+    output.set("lastSyncError", errorText);
+}
+
+async function markImageSynced(record, uploadResult, deletedImageIds, deleteResponses) {
+    const nowIso = new Date().toISOString();
+
+    const rawResponse = {
+        syncedAt: nowIso,
+        variationId: normalizeText(record.getCellValueAsString(PCM_PROCESSOR_VARIATION_ID)),
+        imageGroupKey: getImageGroupKey(record),
+        sourceRecordId: uploadResult.sourceRecordId,
+        sourceAttachmentFileName: uploadResult.sourceAttachmentFileName,
+        deletedPreviousImageIds: deletedImageIds,
+        deleteResponses,
+        uploadedProcessorImageId: uploadResult.imageId,
+        squareImageResponse: uploadResult.response
+    };
+
+    await processorCatalogMapTable.updateRecordAsync(record.id, {
+        [IMG_PROCESSOR_IMAGE_ID]: uploadResult.imageId,
+        [IMG_SYNC_STATUS]: selectValue(STATUS_SYNCED),
+        [IMG_LAST_SYNC_AT]: nowIso,
+        [IMG_SYNC_ERROR]: "",
+        [IMG_RAW_SYNC_RESPONSE]: safeStringify(rawResponse)
+    });
+}
+
+async function getCatalogMapRecords() {
+    return await processorCatalogMapTable.selectRecordsAsync({
+        fields: [
+            PCM_CATALOG_MAP_ID,
+            PCM_PROCESSOR_SKU,
+            PCM_PROCESSOR_ITEM_NAME,
+            PCM_PROCESSOR_VARIATION_NAME,
+            PCM_PROCESSOR_ITEM_ID,
+            PCM_PROCESSOR_VARIATION_ID,
+            PCM_PROCESSOR_CATALOG_OBJECT_ID,
+            IMG_PRODUCT_IMAGES,
+            IMG_IMAGE_GROUP_KEY,
+            IMG_SYNC_TO_PROCESSOR,
+            IMG_SYNC_STATUS,
+            IMG_LAST_SYNC_AT,
+            IMG_PROCESSOR_IMAGE_ID,
+            IMG_SYNC_ERROR,
+            IMG_RAW_SYNC_RESPONSE
+        ]
+    });
+}
+
+async function syncOneRecord(record, allRecords) {
+    const validation = validateReadyRecord(record);
+
+    if (validation.status === "needs_review") {
+        await markNeedsReview(record, validation.message);
+        return {
+            status: "needs_review",
+            recordId: record.id
+        };
+    }
+
+    const source = findSourceImageForGroup(record, allRecords);
+
+    if (!source.attachment) {
+        await markNeedsReview(
+            record,
+            `No Product Images attachment found on this record or any record with Image Group Key "${getImageGroupKey(record)}".`
+        );
+
+        return {
+            status: "needs_review",
+            recordId: record.id
+        };
+    }
+
+    const existingImageIds = getProcessorImageIds(record);
+    const deleteResponses = [];
+
+    try {
+        for (const imageId of existingImageIds) {
+            const deleteResponse = await deleteSquareImage(imageId);
+            deleteResponses.push({
+                imageId,
+                response: deleteResponse
+            });
+        }
+
+        const uploadResult = await createSquareImageForVariation(record, source.sourceRecord, source.attachment);
+
+        await markImageSynced(record, uploadResult, existingImageIds, deleteResponses);
+
+        return {
+            status: "synced",
+            recordId: record.id,
+            processorImageId: uploadResult.imageId
+        };
+    } catch (error) {
+        await markSyncError(record, error);
+
+        return {
+            status: "sync_error",
+            recordId: record.id,
+            error: error.message || String(error)
+        };
+    }
+}
+
+async function main() {
+    if (!catalogMapRecordId) {
+        throw new Error("Missing required input variable: catalogMapRecordId.");
+    }
+
+    const query = await getCatalogMapRecords();
+    const triggerRecord = query.getRecord(catalogMapRecordId);
+
+    if (!triggerRecord) {
+        throw new Error(`Could not find triggering PROCESSOR CATALOG MAP record: ${catalogMapRecordId}`);
+    }
+
+    const readyRecords = query.records.filter(isImageSyncReady);
+    const imageCandidateRecords = query.records.filter(isImageCandidate);
+
+    if (readyRecords.length === 0) {
+        output.set("result", "no_ready_records");
+        output.set("message", "No PROCESSOR CATALOG MAP records are currently READY TO SYNC for image sync.");
+        return;
+    }
+
+    const results = [];
+
+    for (const record of readyRecords) {
+        const result = await syncOneRecord(record, imageCandidateRecords);
+        results.push(result);
+    }
+
+    const syncedCount = results.filter(result => result.status === "synced").length;
+    const needsReviewCount = results.filter(result => result.status === "needs_review").length;
+    const syncErrorCount = results.filter(result => result.status === "sync_error").length;
+
+    output.set("result", syncErrorCount > 0 ? "completed_with_errors" : "completed");
+    output.set("syncedCount", syncedCount);
+    output.set("needsReviewCount", needsReviewCount);
+    output.set("syncErrorCount", syncErrorCount);
+    output.set("details", JSON.stringify(results, null, 2));
+}
+
+await main();
