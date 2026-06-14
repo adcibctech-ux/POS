@@ -1,0 +1,634 @@
+/***************************************************************
+ * SCRIPT: INV-1-SquareInventoryMovement-v26.0.0
+ * SYSTEM: ADC|IBC POS Backend
+ * TABLE(S):
+ * - TRANSACTION LINES
+ * - TRANSACTIONS
+ * - INVENTORY LOCATIONS
+ * - INVENTORY SUMMARY
+ * - INVENTORY MOVEMENTS
+ *
+ * PURPOSE:
+ * Creates one inventory movement from one eligible Square transaction
+ * line. This is the bridge from POS transaction line processing into
+ * Airtable inventory movement tracking.
+ *
+ * VERSIONING:
+ * INV-1-SquareInventoryMovement-v26.0.0
+ *
+ * Version format:
+ * - INV-1 = first inventory automation script.
+ * - SquareInventoryMovement = source-specific inventory depletion workflow.
+ * - v26 = 2026 system standard.
+ * - .0 = first INV-1 branch.
+ * - .0 = first release of this branch.
+ *
+ * SCRIPT BEHAVIOR:
+ * 1. Runs when one TRANSACTION LINES record enters the Ready for
+ *    Inventory Movement view.
+ * 2. Processes ONLY the triggering transaction line.
+ * 3. If the line is a custom amount:
+ *    - does NOT create an inventory movement.
+ *    - sets Line Status = Needs Review.
+ *    - appends an INV-1 note to Line Note.
+ * 4. For inventory-eligible catalog item lines:
+ *    - requires exactly one linked Transaction.
+ *    - requires exactly one linked Matched Item.
+ *    - requires Quantity > 0.
+ *    - requires Transaction {Processor Staff ID}.
+ *    - matches Transaction {Processor Staff ID} to
+ *      INVENTORY LOCATIONS {Processor Staff Identifier}.
+ *    - requires exactly one matching active Inventory Location.
+ *    - finds or creates INVENTORY SUMMARY for Item + Inventory Location.
+ *    - creates INVENTORY MOVEMENTS record:
+ *        Movement Type = Sale
+ *        Fulfillment Stage = Sale
+ *        Items = Matched Item
+ *        Inventory Location = matched location
+ *        Inventory Summary = matched/created summary
+ *        City = Transaction Assigned City, if available
+ *        Quantity Change = negative line quantity
+ *        Related Transaction Lines = triggering line
+ *        Source = Square POS
+ *        Created By = Automation
+ *        Movement Status = Completed
+ *    - marks Transaction Line Inventory Movement Created? = checked.
+ *    - links created movement back to the transaction line.
+ * 5. Updates the parent Transaction {Inventory Movements Created?}
+ *    only when all linked transaction lines are accounted for.
+ *
+ * UPDATES / BUG FIXES:
+ * v26.0.0
+ * - Initial inventory movement creation script.
+ * - Processes one transaction line at a time.
+ * - Matches inventory location using Transaction Processor Staff ID.
+ * - Finds or creates item/location Inventory Summary records.
+ * - Flags custom amount lines for review instead of creating movements.
+ *
+ * IMPORTANT:
+ * - Before running, ensure INVENTORY MOVEMENTS {Source} includes:
+ *      Square POS
+ * - This script intentionally does not batch-process the full queue.
+ *
+ * REQUIRED AIRTABLE AUTOMATION INPUTS:
+ * - transactionLineRecordId
+ ***************************************************************/
+
+const config = input.config();
+const transactionLineRecordId = String(config.transactionLineRecordId || "").trim();
+
+const TRANSACTION_LINES_TABLE_ID = "tblXynouQIUSyiElb";
+const TRANSACTIONS_TABLE_ID = "tbl2VkAAkbbxYucDK";
+const INVENTORY_LOCATIONS_TABLE_ID = "tbly0zsqclh8cXMMG";
+const INVENTORY_SUMMARY_TABLE_ID = "tblSrW8Ysn1FALeL4";
+const INVENTORY_MOVEMENTS_TABLE_ID = "tbl3KNFCOMFCpiYj8";
+
+// TRANSACTION LINES fields
+const TL_LINE_STATUS = "Line Status";
+const TL_FULFILLMENT_STATUS = "Fulfillment Status";
+const TL_TRANSACTION = "Transaction";
+const TL_LINE_ITEM_NAME = "Line Item Name";
+const TL_VARIATION_NAME = "Variation Name";
+const TL_SKU = "SKU";
+const TL_MATCHED_ITEM = "Matched Item";
+const TL_QUANTITY = "Quantity";
+const TL_IS_CUSTOM_AMOUNT = "Is Custom Amount?";
+const TL_LINE_NOTE = "Line Note";
+const TL_ITEMIZATION_TYPE = "Itemization Type";
+const TL_INVENTORY_ELIGIBLE = "Inventory Eligible?";
+const TL_INVENTORY_MOVEMENT_CREATED = "Inventory Movement Created?";
+const TL_INVENTORY_MOVEMENTS = "Inventory Movements";
+
+// TRANSACTIONS fields
+const TX_PROCESSOR_PAYMENT_ID = "Processor Payment ID";
+const TX_PROCESSOR_ORDER_ID = "Processor Order ID";
+const TX_PROCESSOR_STAFF_ID = "Processor Staff ID";
+const TX_PROCESSOR_LOCATION_ID = "Processor Location ID";
+const TX_PROCESSOR_LOCATION_NAME = "Processor Location Name";
+const TX_TRANSACTION_TIMESTAMP = "Transaction Timestamp";
+const TX_ASSIGNED_CITY = "Assigned City";
+const TX_INVENTORY_MOVEMENTS_CREATED = "Inventory Movements Created?";
+const TX_TRANSACTION_LINES = "Transaction Lines";
+const TX_NOTES = "Notes";
+
+// INVENTORY LOCATIONS fields
+const LOC_INVENTORY_LOCATION = "Inventory Location";
+const LOC_PROCESSOR_STAFF_IDENTIFIER = "Processor Staff Identifier";
+const LOC_ACTIVE = "Active";
+
+// INVENTORY SUMMARY fields
+const SUM_ITEM = "Item";
+const SUM_INVENTORY_LOCATION = "Inventory Location";
+const SUM_NOTES = "Notes";
+
+// INVENTORY MOVEMENTS fields
+const MOV_MOVEMENT_TYPE = "Movement Type";
+const MOV_FULFILLMENT_STAGE = "Fulfillment Stage";
+const MOV_ITEMS = "Items";
+const MOV_INVENTORY_LOCATION = "Inventory Location";
+const MOV_INVENTORY_SUMMARY = "Inventory Summary";
+const MOV_CITY = "City";
+const MOV_QUANTITY_CHANGE = "Quantity Change";
+const MOV_RELATED_TRANSACTION_LINES = "Related Transaction Lines";
+const MOV_SOURCE = "Source";
+const MOV_CREATED_BY = "Created By";
+const MOV_MOVEMENT_STATUS = "Movement Status";
+const MOV_NOTES = "Notes";
+
+// Select values
+const LINE_STATUS_MATCHED = "Matched";
+const LINE_STATUS_NEEDS_REVIEW = "Needs Review";
+
+const FULFILLMENT_STATUS_NOT_REQUIRED = "Not Required";
+
+const MOVEMENT_TYPE_SALE = "Sale";
+const FULFILLMENT_STAGE_SALE = "Sale";
+const MOVEMENT_SOURCE_SQUARE_POS = "Square POS";
+const MOVEMENT_CREATED_BY_AUTOMATION = "Automation";
+const MOVEMENT_STATUS_COMPLETED = "Completed";
+
+const transactionLinesTable = base.getTable(TRANSACTION_LINES_TABLE_ID);
+const transactionsTable = base.getTable(TRANSACTIONS_TABLE_ID);
+const inventoryLocationsTable = base.getTable(INVENTORY_LOCATIONS_TABLE_ID);
+const inventorySummaryTable = base.getTable(INVENTORY_SUMMARY_TABLE_ID);
+const inventoryMovementsTable = base.getTable(INVENTORY_MOVEMENTS_TABLE_ID);
+
+function selectValue(name) {
+    return { name };
+}
+
+function normalizeText(value) {
+    if (value === null || value === undefined) return "";
+    return String(value).trim();
+}
+
+function normalizeKey(value) {
+    return normalizeText(value).toLowerCase();
+}
+
+function safeStringify(value) {
+    try {
+        return JSON.stringify(value, null, 2);
+    } catch (error) {
+        return String(value);
+    }
+}
+
+function getLinkedRecordIds(record, fieldName) {
+    return (record.getCellValue(fieldName) || []).map(link => link.id);
+}
+
+function getSingleLinkedRecordId(record, fieldName) {
+    const linkedIds = getLinkedRecordIds(record, fieldName);
+    return linkedIds.length === 1 ? linkedIds[0] : null;
+}
+
+function getSelectName(record, fieldName) {
+    return record.getCellValue(fieldName)?.name || "";
+}
+
+function numberValue(record, fieldName) {
+    const value = record.getCellValue(fieldName);
+    return typeof value === "number" ? value : 0;
+}
+
+function getInventoryEligibleValue(record) {
+    return normalizeText(record.getCellValueAsString(TL_INVENTORY_ELIGIBLE)).toUpperCase();
+}
+
+function isInventoryEligible(record) {
+    return getInventoryEligibleValue(record) === "YES";
+}
+
+function isCustomAmount(record) {
+    return record.getCellValue(TL_IS_CUSTOM_AMOUNT) === true ||
+        getSelectName(record, TL_ITEMIZATION_TYPE) === "Custom Amount";
+}
+
+function appendNote(existingNote, newNote) {
+    const oldText = normalizeText(existingNote);
+    const timestamp = new Date().toISOString();
+    const lineToAdd = `[${timestamp}] ${newNote}`;
+
+    return oldText ? `${oldText}\n${lineToAdd}` : lineToAdd;
+}
+
+function makeMovementNote({ lineRecord, transactionRecord, locationRecord, summaryRecord }) {
+    const sku = normalizeText(lineRecord.getCellValueAsString(TL_SKU));
+    const lineName = normalizeText(lineRecord.getCellValueAsString(TL_LINE_ITEM_NAME));
+    const variationName = normalizeText(lineRecord.getCellValueAsString(TL_VARIATION_NAME));
+    const paymentId = normalizeText(transactionRecord.getCellValueAsString(TX_PROCESSOR_PAYMENT_ID));
+    const orderId = normalizeText(transactionRecord.getCellValueAsString(TX_PROCESSOR_ORDER_ID));
+    const locationName = normalizeText(locationRecord.getCellValueAsString(LOC_INVENTORY_LOCATION));
+
+    return [
+        "INV-1: Created automatically from Square transaction line.",
+        `Line: ${lineName || "Unnamed line"}`,
+        variationName ? `Variation: ${variationName}` : null,
+        sku ? `SKU: ${sku}` : null,
+        paymentId ? `Processor Payment ID: ${paymentId}` : null,
+        orderId ? `Processor Order ID: ${orderId}` : null,
+        locationName ? `Inventory Location: ${locationName}` : null,
+        `Inventory Summary: ${summaryRecord.id}`
+    ].filter(Boolean).join("\n");
+}
+
+async function markLineNeedsReview(lineRecord, message) {
+    await transactionLinesTable.updateRecordAsync(lineRecord.id, {
+        [TL_LINE_STATUS]: selectValue(LINE_STATUS_NEEDS_REVIEW),
+        [TL_FULFILLMENT_STATUS]: selectValue(FULFILLMENT_STATUS_NOT_REQUIRED),
+        [TL_LINE_NOTE]: appendNote(
+            lineRecord.getCellValueAsString(TL_LINE_NOTE),
+            `INV-1: ${message}`
+        )
+    });
+
+    output.set("result", "needs_review");
+    output.set("transactionLineRecordId", lineRecord.id);
+    output.set("message", message);
+}
+
+async function getTransactionLineQuery() {
+    return await transactionLinesTable.selectRecordsAsync({
+        fields: [
+            TL_LINE_STATUS,
+            TL_FULFILLMENT_STATUS,
+            TL_TRANSACTION,
+            TL_LINE_ITEM_NAME,
+            TL_VARIATION_NAME,
+            TL_SKU,
+            TL_MATCHED_ITEM,
+            TL_QUANTITY,
+            TL_IS_CUSTOM_AMOUNT,
+            TL_LINE_NOTE,
+            TL_ITEMIZATION_TYPE,
+            TL_INVENTORY_ELIGIBLE,
+            TL_INVENTORY_MOVEMENT_CREATED,
+            TL_INVENTORY_MOVEMENTS
+        ]
+    });
+}
+
+async function getTransactionQuery() {
+    return await transactionsTable.selectRecordsAsync({
+        fields: [
+            TX_PROCESSOR_PAYMENT_ID,
+            TX_PROCESSOR_ORDER_ID,
+            TX_PROCESSOR_STAFF_ID,
+            TX_PROCESSOR_LOCATION_ID,
+            TX_PROCESSOR_LOCATION_NAME,
+            TX_TRANSACTION_TIMESTAMP,
+            TX_ASSIGNED_CITY,
+            TX_INVENTORY_MOVEMENTS_CREATED,
+            TX_TRANSACTION_LINES,
+            TX_NOTES
+        ]
+    });
+}
+
+async function getInventoryLocationsQuery() {
+    return await inventoryLocationsTable.selectRecordsAsync({
+        fields: [
+            LOC_INVENTORY_LOCATION,
+            LOC_PROCESSOR_STAFF_IDENTIFIER,
+            LOC_ACTIVE
+        ]
+    });
+}
+
+async function getInventorySummaryQuery() {
+    return await inventorySummaryTable.selectRecordsAsync({
+        fields: [
+            SUM_ITEM,
+            SUM_INVENTORY_LOCATION,
+            SUM_NOTES
+        ]
+    });
+}
+
+function findInventoryLocationByStaffId(inventoryLocationRecords, processorStaffId) {
+    const staffIdKey = normalizeKey(processorStaffId);
+
+    return inventoryLocationRecords.filter(locationRecord => {
+        const locationStaffId = normalizeKey(locationRecord.getCellValueAsString(LOC_PROCESSOR_STAFF_IDENTIFIER));
+        const isActive = locationRecord.getCellValue(LOC_ACTIVE) === true;
+
+        return isActive && locationStaffId && locationStaffId === staffIdKey;
+    });
+}
+
+function findInventorySummary(summaryRecords, itemRecordId, inventoryLocationRecordId) {
+    return summaryRecords.find(summaryRecord => {
+        const itemIds = getLinkedRecordIds(summaryRecord, SUM_ITEM);
+        const locationIds = getLinkedRecordIds(summaryRecord, SUM_INVENTORY_LOCATION);
+
+        return itemIds.includes(itemRecordId) &&
+            locationIds.includes(inventoryLocationRecordId);
+    });
+}
+
+async function findOrCreateInventorySummary({
+    summaryRecords,
+    itemRecordId,
+    inventoryLocationRecordId,
+    lineRecord,
+    transactionRecord
+}) {
+    const existingSummary = findInventorySummary(
+        summaryRecords,
+        itemRecordId,
+        inventoryLocationRecordId
+    );
+
+    if (existingSummary) {
+        return {
+            summaryRecord: existingSummary,
+            created: false
+        };
+    }
+
+    const createdSummary = await inventorySummaryTable.createRecordAsync({
+        [SUM_ITEM]: [{ id: itemRecordId }],
+        [SUM_INVENTORY_LOCATION]: [{ id: inventoryLocationRecordId }],
+        [SUM_NOTES]: [
+            "INV-1: Inventory summary created automatically.",
+            `Source transaction line: ${lineRecord.id}`,
+            `Source transaction: ${transactionRecord.id}`
+        ].join("\n")
+    });
+
+    const refreshedSummaryQuery = await getInventorySummaryQuery();
+    const summaryRecord = refreshedSummaryQuery.getRecord(createdSummary);
+
+    return {
+        summaryRecord,
+        created: true
+    };
+}
+
+async function createInventoryMovement({
+    lineRecord,
+    transactionRecord,
+    itemRecordId,
+    inventoryLocationRecord,
+    inventorySummaryRecord
+}) {
+    const quantity = numberValue(lineRecord, TL_QUANTITY);
+    const assignedCityIds = getLinkedRecordIds(transactionRecord, TX_ASSIGNED_CITY);
+    const quantityChange = -Math.abs(quantity);
+
+    const fields = {
+        [MOV_MOVEMENT_TYPE]: selectValue(MOVEMENT_TYPE_SALE),
+        [MOV_FULFILLMENT_STAGE]: selectValue(FULFILLMENT_STAGE_SALE),
+        [MOV_ITEMS]: [{ id: itemRecordId }],
+        [MOV_INVENTORY_LOCATION]: [{ id: inventoryLocationRecord.id }],
+        [MOV_INVENTORY_SUMMARY]: [{ id: inventorySummaryRecord.id }],
+        [MOV_QUANTITY_CHANGE]: quantityChange,
+        [MOV_RELATED_TRANSACTION_LINES]: [{ id: lineRecord.id }],
+        [MOV_SOURCE]: selectValue(MOVEMENT_SOURCE_SQUARE_POS),
+        [MOV_CREATED_BY]: selectValue(MOVEMENT_CREATED_BY_AUTOMATION),
+        [MOV_MOVEMENT_STATUS]: selectValue(MOVEMENT_STATUS_COMPLETED),
+        [MOV_NOTES]: makeMovementNote({
+            lineRecord,
+            transactionRecord,
+            locationRecord: inventoryLocationRecord,
+            summaryRecord: inventorySummaryRecord
+        })
+    };
+
+    if (assignedCityIds.length === 1) {
+        fields[MOV_CITY] = [{ id: assignedCityIds[0] }];
+    }
+
+    const movementRecordId = await inventoryMovementsTable.createRecordAsync(fields);
+
+    return movementRecordId;
+}
+
+async function updateTransactionLineAfterMovement(lineRecord, movementRecordId) {
+    const existingMovementIds = getLinkedRecordIds(lineRecord, TL_INVENTORY_MOVEMENTS);
+    const mergedMovementIds = Array.from(new Set([...existingMovementIds, movementRecordId]));
+
+    await transactionLinesTable.updateRecordAsync(lineRecord.id, {
+        [TL_INVENTORY_MOVEMENT_CREATED]: true,
+        [TL_INVENTORY_MOVEMENTS]: mergedMovementIds.map(id => ({ id })),
+        [TL_LINE_STATUS]: selectValue(LINE_STATUS_MATCHED),
+        [TL_LINE_NOTE]: appendNote(
+            lineRecord.getCellValueAsString(TL_LINE_NOTE),
+            `INV-1: Created inventory movement ${movementRecordId}.`
+        )
+    });
+}
+
+async function updateTransactionInventoryCompleteIfReady({
+    transactionRecord,
+    transactionLineQuery
+}) {
+    const transactionLineIds = getLinkedRecordIds(transactionRecord, TX_TRANSACTION_LINES);
+
+    if (transactionLineIds.length === 0) {
+        return false;
+    }
+
+    let allLinesAccountedFor = true;
+
+    for (const lineId of transactionLineIds) {
+        const lineRecord = transactionLineQuery.getRecord(lineId);
+
+        if (!lineRecord) {
+            allLinesAccountedFor = false;
+            break;
+        }
+
+        const customAmount = isCustomAmount(lineRecord);
+        const movementCreated = lineRecord.getCellValue(TL_INVENTORY_MOVEMENT_CREATED) === true;
+        const eligible = isInventoryEligible(lineRecord);
+
+        if (customAmount) {
+            allLinesAccountedFor = false;
+            break;
+        }
+
+        if (eligible && !movementCreated) {
+            allLinesAccountedFor = false;
+            break;
+        }
+    }
+
+    if (allLinesAccountedFor) {
+        await transactionsTable.updateRecordAsync(transactionRecord.id, {
+            [TX_INVENTORY_MOVEMENTS_CREATED]: true,
+            [TX_NOTES]: appendNote(
+                transactionRecord.getCellValueAsString(TX_NOTES),
+                "INV-1: All eligible transaction lines have inventory movements."
+            )
+        });
+    }
+
+    return allLinesAccountedFor;
+}
+
+async function main() {
+    if (!transactionLineRecordId) {
+        throw new Error("Missing required input variable: transactionLineRecordId.");
+    }
+
+    const transactionLineQuery = await getTransactionLineQuery();
+    const transactionQuery = await getTransactionQuery();
+    const inventoryLocationsQuery = await getInventoryLocationsQuery();
+    const inventorySummaryQuery = await getInventorySummaryQuery();
+
+    const lineRecord = transactionLineQuery.getRecord(transactionLineRecordId);
+
+    if (!lineRecord) {
+        throw new Error(`Could not find triggering TRANSACTION LINES record: ${transactionLineRecordId}`);
+    }
+
+    if (lineRecord.getCellValue(TL_INVENTORY_MOVEMENT_CREATED) === true) {
+        output.set("result", "already_processed");
+        output.set("transactionLineRecordId", lineRecord.id);
+        output.set("message", "Inventory Movement Created? is already checked.");
+        return;
+    }
+
+    if (isCustomAmount(lineRecord)) {
+        await markLineNeedsReview(
+            lineRecord,
+            "Custom amount line detected. No inventory movement created because custom POS transactions should not occur in production."
+        );
+        return;
+    }
+
+    if (!isInventoryEligible(lineRecord)) {
+        await markLineNeedsReview(
+            lineRecord,
+            `Line is not inventory eligible. Inventory Eligible? = "${getInventoryEligibleValue(lineRecord) || "blank"}".`
+        );
+        return;
+    }
+
+    const quantity = numberValue(lineRecord, TL_QUANTITY);
+
+    if (quantity <= 0) {
+        await markLineNeedsReview(
+            lineRecord,
+            `Quantity must be greater than 0 before creating a sale movement. Found quantity: ${quantity}.`
+        );
+        return;
+    }
+
+    const transactionRecordId = getSingleLinkedRecordId(lineRecord, TL_TRANSACTION);
+
+    if (!transactionRecordId) {
+        await markLineNeedsReview(
+            lineRecord,
+            "Exactly one linked Transaction is required before creating inventory movement."
+        );
+        return;
+    }
+
+    const transactionRecord = transactionQuery.getRecord(transactionRecordId);
+
+    if (!transactionRecord) {
+        await markLineNeedsReview(
+            lineRecord,
+            `Linked Transaction record could not be found: ${transactionRecordId}.`
+        );
+        return;
+    }
+
+    const itemRecordId = getSingleLinkedRecordId(lineRecord, TL_MATCHED_ITEM);
+
+    if (!itemRecordId) {
+        await markLineNeedsReview(
+            lineRecord,
+            "Exactly one linked Matched Item is required before creating inventory movement."
+        );
+        return;
+    }
+
+    const processorStaffId = normalizeText(transactionRecord.getCellValueAsString(TX_PROCESSOR_STAFF_ID));
+
+    if (!processorStaffId) {
+        await markLineNeedsReview(
+            lineRecord,
+            "Transaction Processor Staff ID is blank. Cannot match inventory location."
+        );
+        return;
+    }
+
+    const matchingLocations = findInventoryLocationByStaffId(
+        inventoryLocationsQuery.records,
+        processorStaffId
+    );
+
+    if (matchingLocations.length === 0) {
+        await markLineNeedsReview(
+            lineRecord,
+            `No active Inventory Location matches Transaction Processor Staff ID "${processorStaffId}" using Processor Staff Identifier.`
+        );
+        return;
+    }
+
+    if (matchingLocations.length > 1) {
+        await markLineNeedsReview(
+            lineRecord,
+            `Multiple active Inventory Locations match Transaction Processor Staff ID "${processorStaffId}". Matching location records: ${matchingLocations.map(record => record.id).join(", ")}.`
+        );
+        return;
+    }
+
+    const inventoryLocationRecord = matchingLocations[0];
+
+    const { summaryRecord, created: summaryCreated } = await findOrCreateInventorySummary({
+        summaryRecords: inventorySummaryQuery.records,
+        itemRecordId,
+        inventoryLocationRecordId: inventoryLocationRecord.id,
+        lineRecord,
+        transactionRecord
+    });
+
+    if (!summaryRecord) {
+        await markLineNeedsReview(
+            lineRecord,
+            "Inventory Summary could not be found or created."
+        );
+        return;
+    }
+
+    try {
+        const movementRecordId = await createInventoryMovement({
+            lineRecord,
+            transactionRecord,
+            itemRecordId,
+            inventoryLocationRecord,
+            inventorySummaryRecord: summaryRecord
+        });
+
+        await updateTransactionLineAfterMovement(lineRecord, movementRecordId);
+
+        const refreshedTransactionLineQuery = await getTransactionLineQuery();
+        const allLinesComplete = await updateTransactionInventoryCompleteIfReady({
+            transactionRecord,
+            transactionLineQuery: refreshedTransactionLineQuery
+        });
+
+        output.set("result", "created_inventory_movement");
+        output.set("transactionLineRecordId", lineRecord.id);
+        output.set("transactionRecordId", transactionRecord.id);
+        output.set("inventoryMovementRecordId", movementRecordId);
+        output.set("inventoryLocationRecordId", inventoryLocationRecord.id);
+        output.set("inventorySummaryRecordId", summaryRecord.id);
+        output.set("inventorySummaryCreated", summaryCreated);
+        output.set("transactionInventoryMovementsComplete", allLinesComplete);
+    } catch (error) {
+        await markLineNeedsReview(
+            lineRecord,
+            `Failed to create inventory movement: ${error.message || String(error)}`
+        );
+
+        output.set("rawError", safeStringify(error));
+    }
+}
+
+await main();
