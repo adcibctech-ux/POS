@@ -1,0 +1,909 @@
+////////////////////////////////////////////////////////////////////////////////
+// SUB-1-SubmissionParser-v26.0.0
+// POS Backend | INVENTORY SUBMISSIONS → DRAFT ITEMS
+//
+// PURPOSE
+// Parses one raw INVENTORY SUBMISSIONS record into normalized DRAFT ITEMS rows.
+// This script does NOT create ITEM LIBRARY records, PROCESSOR CATALOG MAP records,
+// or INVENTORY MOVEMENTS.
+//
+// REQUIRED AUTOMATION INPUT
+//   submissionRecordId
+//
+// RECOMMENDED TRIGGER
+//   When INVENTORY SUBMISSIONS record enters view:
+//   - Parser Status = Not Parsed, blank, or Failed/Needs Review and ready to retry
+//   - Submission Status = Draft or Ready for Aud Review, depending your workflow
+//
+// SAFETY BEHAVIOR
+//   - Deletes old linked draft items ONLY when Draft Status is blank or "Draft".
+//   - Preserves old draft items that have moved into review/approval/processed states.
+//   - Creates one DRAFT ITEMS row per positive quantity field.
+//   - Negative/decimal quantities create parser errors and block parsing.
+//   - Missing category map creates warnings but does not block draft row creation.
+//
+// VERSION
+//   v26.0.0
+////////////////////////////////////////////////////////////////////////////////
+
+const CONFIG = input.config();
+const submissionRecordId = (CONFIG.submissionRecordId || "").trim();
+
+if (!submissionRecordId) {
+    throw new Error("Missing required input variable: submissionRecordId");
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// TABLES
+////////////////////////////////////////////////////////////////////////////////
+
+const submissionsTable = base.getTable("INVENTORY SUBMISSIONS");
+const draftItemsTable = base.getTable("DRAFT ITEMS");
+const categoryMapTable = base.getTable("PROCESSOR CATEGORY MAP");
+
+////////////////////////////////////////////////////////////////////////////////
+// FIELD NAMES
+////////////////////////////////////////////////////////////////////////////////
+
+const SUB = {
+    submissionId: "Submission ID",
+    status: "Submission Status",
+    design: "Design",
+    productType: "Product Type",
+    parentCategory: "Parent Category",
+    subcategory: "Subcategory",
+    unitPrice: "Unit Price",
+    unitCost: "Unit Cost",
+    productionLocation: "Production Location",
+    parserStatus: "Parser Status",
+    parserNotes: "Parser Notes",
+    itemDrafts: "Item Drafts",
+};
+
+const DRAFT = {
+    draftSku: "Draft SKU",
+    draftStatus: "Draft Status",
+    inventorySubmission: "Inventory Submission",
+    design: "Design",
+    designName: "Design Name",
+    designCode: "Design Code",
+    productType: "Product Type",
+    newProductType: "New Product Type",
+    parentCategory: "Parent Category",
+    subcategory: "Subcategory",
+    processorCategoryMap: "Processor Category Map",
+    colorFamily: "Color Family",
+    size: "Size",
+    itemName: "Item Name",
+    variantName: "Variant Name",
+    barcodeValue: "Barcode Value",
+    unitPrice: "Unit Price",
+    unitCost: "Unit Cost",
+    startingProductionQuantity: "Starting Production Quantity",
+    productionLocation: "Production Location",
+    productImage: "Product Image",
+    imageGroupKey: "Image Group Key",
+    validationStatus: "Validation Status",
+    validationNotes: "Validation Notes",
+    processingStatus: "Processing Status",
+};
+
+const CATMAP = {
+    categoryType: "Airtable Category Type",
+    categoryName: "Airtable Category Name",
+    processorCategoryId: "Processor Category ID",
+    syncStatus: "Sync Status",
+    catalogProcessor: "Catalog Processor",
+    processorEnvironment: "Processor Environment",
+};
+
+////////////////////////////////////////////////////////////////////////////////
+// CONSTANTS
+////////////////////////////////////////////////////////////////////////////////
+
+const COLOR_BUCKETS = [
+    { code: "BLK", label: "Black", imageField: "BLK Image" },
+    { code: "WHT", label: "White", imageField: "WHT Image" },
+    { code: "GRY", label: "Grey", imageField: "GRY Image" },
+    { code: "COL", label: "Color", imageField: "COL Image" },
+];
+
+const SIZE_CODES = ["OS", "YS", "YM", "YL", "XS", "SM", "MD", "LG", "XL", "2X", "3X"];
+
+const NOC_BUCKET = {
+    code: "NOC",
+    label: "No Color",
+    size: "OS",
+    qtyField: "NOC OS Qty",
+};
+
+const DRAFT_DELETE_STATUSES = new Set(["", "Draft"]);
+
+const FINAL_OR_REVIEW_STATUSES = new Set([
+    "Aud Reviewed",
+    "Ready for Ari Review",
+    "Needs Changes",
+    "Approved",
+    "Processed to Catalog",
+    "Rejected",
+]);
+
+////////////////////////////////////////////////////////////////////////////////
+// PRODUCT TYPE MAPPING
+////////////////////////////////////////////////////////////////////////////////
+
+const PRODUCT_TYPE_MAP = {
+    "Admin > REGIONALS Teacher Pass": {
+        draftProductType: "REGIONALS Teacher Pass",
+        code: "REGPASS",
+    },
+    "Admin > FINALS VIP Pass": {
+        draftProductType: "FINALS VIP Pass",
+        code: "VIPPASS",
+    },
+
+    "Tops > Tee": {
+        draftProductType: "Tee",
+        code: "TEE",
+    },
+    "Tops > Long Sleeve Tee": {
+        draftProductType: "Long Sleeve Tee",
+        code: "LSTEE",
+    },
+    "Tops > Sleeveless Tank": {
+        draftProductType: "Sleeveless Tank",
+        code: "SLTANK",
+    },
+    "Tops > Men's Tank": {
+        draftProductType: "Men's Tank",
+        code: "MTANK",
+    },
+    "Tops > Ribbed Tank": {
+        draftProductType: "Ribbed Tank",
+        code: "RIBTANK",
+    },
+    "Tops > Athletic Tank": {
+        draftProductType: "Athletic Tank",
+        code: "ATHTANK",
+    },
+    "Tops > Crop Top": {
+        draftProductType: "Crop Top",
+        code: "CROP",
+    },
+    "Tops > Long Sleeve Crop Top": {
+        draftProductType: "Long Sleeve Crop Top",
+        code: "LSCROP",
+    },
+    "Tops > Dance Top": {
+        draftProductType: "Dance Top",
+        code: "DANCETOP",
+    },
+
+    "Sweatshirts > Crewneck": {
+        draftProductType: "Crewneck",
+        code: "CREW",
+    },
+    "Sweatshirts > Sweatshirt": {
+        draftProductType: "Sweatshirt",
+        code: "SWT",
+    },
+    "Sweatshirts > Hoodie": {
+        draftProductType: "Hoodie",
+        code: "HOOD",
+    },
+    "Sweatshirts > Zip Hoodie": {
+        draftProductType: "Zip Hoodie",
+        code: "ZIPHOOD",
+    },
+    "Sweatshirts > Quarter-Zip": {
+        draftProductType: "Quarter-Zip",
+        code: "QZIP",
+    },
+    "Sweatshirts > Pullover": {
+        draftProductType: "Pullover",
+        code: "PULL",
+    },
+
+    "Outerwear > Jacket": {
+        draftProductType: "Jacket",
+        code: "JKT",
+    },
+    "Outerwear > Puffer Jacket": {
+        draftProductType: "Puffer Jacket",
+        code: "PUFFER",
+    },
+    "Outerwear > Windbreaker": {
+        draftProductType: "Windbreaker",
+        code: "WIND",
+    },
+    "Outerwear > Zip Vest": {
+        draftProductType: "Zip Vest",
+        code: "ZIPVEST",
+    },
+    "Outerwear > Fleece Vest": {
+        draftProductType: "Fleece Vest",
+        code: "FLCVEST",
+    },
+    "Outerwear > Warm-Up Jacket": {
+        draftProductType: "Warm-Up Jacket",
+        code: "WARMJKT",
+    },
+
+    "Bottoms > Shorts": {
+        draftProductType: "Shorts",
+        code: "SHORTS",
+    },
+    "Bottoms > Sweatshorts": {
+        draftProductType: "Sweatshorts",
+        code: "SWTSHRT",
+    },
+    "Bottoms > Pants": {
+        draftProductType: "Pants",
+        code: "PANTS",
+    },
+    "Bottoms > Sweatpants": {
+        draftProductType: "Sweatpants",
+        code: "SWTPANT",
+    },
+    "Bottoms > Joggers": {
+        draftProductType: "Joggers",
+        code: "JOGGER",
+    },
+    "Bottoms > Leggings": {
+        draftProductType: "Leggings",
+        code: "LEGG",
+    },
+    "Bottoms > Dance Pants": {
+        draftProductType: "Dance Pants",
+        code: "DNCPANT",
+    },
+    "Bottoms > Warm-Up Pants": {
+        draftProductType: "Warm-Up Pants",
+        code: "WARMPANT",
+    },
+
+    "Dancewear > Leotard": {
+        draftProductType: "Leotard",
+        code: "LEO",
+    },
+    "Dancewear > Dance Skirt": {
+        draftProductType: "Dance Skirt",
+        code: "DNSKIRT",
+    },
+    "Dancewear > Pull-On Skirt": {
+        draftProductType: "Pull-On Skirt",
+        code: "POSKIRT",
+    },
+    "Dancewear > Wrap Skirt": {
+        draftProductType: "Wrap Skirt",
+        code: "WRAPSKRT",
+    },
+    "Dancewear > Ballet Skirt": {
+        draftProductType: "Ballet Skirt",
+        code: "BALSKIRT",
+    },
+    "Dancewear > Unitard": {
+        draftProductType: "Unitard",
+        code: "UNITARD",
+    },
+    "Dancewear > Sports Bra": {
+        draftProductType: "Sports Bra",
+        code: "SPBRA",
+    },
+    "Dancewear > Dance Shorts": {
+        draftProductType: "Dance Shorts",
+        code: "DNCSHRT",
+    },
+    "Dancewear > Dance Dress": {
+        draftProductType: "Dance Dress",
+        code: "DNCDRESS",
+    },
+    "Dancewear > Tights": {
+        draftProductType: "Tights",
+        code: "TIGHTS",
+    },
+
+    "Accessories > Tote Bag": {
+        draftProductType: "Tote Bag",
+        code: "TOTE",
+    },
+    "Accessories > Backpack": {
+        draftProductType: "Backpack",
+        code: "BPACK",
+    },
+    "Accessories > Duffel Bag": {
+        draftProductType: "Duffel Bag",
+        code: "DUFFEL",
+    },
+    "Accessories > Makeup Bag": {
+        draftProductType: "Makeup Bag",
+        code: "MUBAG",
+    },
+    "Accessories > Water Bottle": {
+        draftProductType: "Water Bottle",
+        code: "BOTTLE",
+    },
+    "Accessories > Tumbler": {
+        draftProductType: "Tumbler",
+        code: "TUMBLR",
+    },
+    "Accessories > Sticker": {
+        draftProductType: "Sticker",
+        code: "STICKR",
+    },
+    "Accessories > Patch": {
+        draftProductType: "Patch",
+        code: "PATCH",
+    },
+    "Accessories > Pin": {
+        draftProductType: "Pin",
+        code: "PIN",
+    },
+    "Accessories > Keychain": {
+        draftProductType: "Keychain",
+        code: "KEYCHN",
+    },
+    "Accessories > Lanyard": {
+        draftProductType: "Lanyard",
+        code: "LNYRD",
+    },
+    "Accessories > Hair Bow": {
+        draftProductType: "Hair Bow",
+        code: "BOW",
+    },
+    "Accessories > Headband": {
+        draftProductType: "Headband",
+        code: "HDBAND",
+    },
+    "Accessories > Beanie": {
+        draftProductType: "Beanie",
+        code: "BEANIE",
+    },
+    "Accessories > Hat": {
+        draftProductType: "Hat",
+        code: "HAT",
+    },
+    "Accessories > Socks": {
+        draftProductType: "Socks",
+        code: "SOCKS",
+    },
+    "Accessories > Towel": {
+        draftProductType: "Towel",
+        code: "TOWEL",
+    },
+    "Accessories > Notebook": {
+        draftProductType: "Notebook",
+        code: "NOTE",
+    },
+};
+
+////////////////////////////////////////////////////////////////////////////////
+// HELPERS
+////////////////////////////////////////////////////////////////////////////////
+
+function getSingleSelectName(record, fieldName) {
+    const value = record.getCellValue(fieldName);
+    return value?.name || "";
+}
+
+function getLinkedRecordIds(record, fieldName) {
+    const value = record.getCellValue(fieldName);
+    if (!Array.isArray(value)) return [];
+    return value.map((linked) => linked.id);
+}
+
+function getLookupTexts(record, fieldName) {
+    const value = record.getCellValue(fieldName);
+    if (!Array.isArray(value)) return [];
+    return value
+        .map((entry) => {
+            if (entry === null || entry === undefined) return "";
+            if (typeof entry === "string") return entry;
+            if (typeof entry === "number") return String(entry);
+            if (entry.name) return entry.name;
+            return String(entry);
+        })
+        .filter(Boolean);
+}
+
+function firstLookupText(record, fieldName) {
+    return getLookupTexts(record, fieldName)[0] || "";
+}
+
+function getNumber(record, fieldName) {
+    const value = record.getCellValue(fieldName);
+    if (value === null || value === undefined || value === "") return null;
+    return Number(value);
+}
+
+function attachmentPayload(record, fieldName) {
+    const value = record.getCellValue(fieldName);
+    if (!Array.isArray(value) || value.length === 0) return [];
+    return value
+        .filter((attachment) => attachment.url)
+        .map((attachment) => ({
+            url: attachment.url,
+            filename: attachment.filename || attachment.name || "attachment",
+        }));
+}
+
+function chunkArray(array, size) {
+    const chunks = [];
+    for (let i = 0; i < array.length; i += size) {
+        chunks.push(array.slice(i, i + size));
+    }
+    return chunks;
+}
+
+function normalizeCode(value) {
+    return String(value || "")
+        .toUpperCase()
+        .replace(/&/g, "AND")
+        .replace(/[^A-Z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .replace(/-+/g, "-");
+}
+
+function makeSku({ designCode, productCode, colorCode, sizeCode }) {
+    const parts = [designCode, productCode, colorCode, sizeCode]
+        .map(normalizeCode)
+        .filter(Boolean);
+    return parts.join("-");
+}
+
+function buildItemName({ designName, draftProductType }) {
+    return [designName, draftProductType].filter(Boolean).join(" ");
+}
+
+function buildVariantName({ colorCode, sizeCode }) {
+    if (colorCode === "NOC" && sizeCode === "OS") return "One Size";
+    return `${colorCode} / ${sizeCode}`;
+}
+
+function formatDraftNotes(notes) {
+    return notes.length ? notes.join("\n") : "";
+}
+
+function isWholeNumber(value) {
+    return Number.isInteger(value);
+}
+
+function positiveQuantityEntriesForBucket(record, bucket, errors) {
+    const entries = [];
+
+    for (const sizeCode of SIZE_CODES) {
+        const fieldName = `${bucket.code} ${sizeCode} Qty`;
+        const quantity = getNumber(record, fieldName);
+
+        if (quantity === null || quantity === 0) continue;
+
+        if (!Number.isFinite(quantity)) {
+            errors.push(`${fieldName}: quantity is not a valid number.`);
+            continue;
+        }
+
+        if (quantity < 0) {
+            errors.push(`${fieldName}: quantity cannot be negative.`);
+            continue;
+        }
+
+        if (!isWholeNumber(quantity)) {
+            errors.push(`${fieldName}: quantity must be a whole number.`);
+            continue;
+        }
+
+        entries.push({
+            colorCode: bucket.code,
+            colorLabel: bucket.label,
+            sizeCode,
+            quantity,
+            imageField: bucket.imageField,
+        });
+    }
+
+    return entries;
+}
+
+function positiveNocEntry(record, errors) {
+    const quantity = getNumber(record, NOC_BUCKET.qtyField);
+
+    if (quantity === null || quantity === 0) return null;
+
+    if (!Number.isFinite(quantity)) {
+        errors.push(`${NOC_BUCKET.qtyField}: quantity is not a valid number.`);
+        return null;
+    }
+
+    if (quantity < 0) {
+        errors.push(`${NOC_BUCKET.qtyField}: quantity cannot be negative.`);
+        return null;
+    }
+
+    if (!isWholeNumber(quantity)) {
+        errors.push(`${NOC_BUCKET.qtyField}: quantity must be a whole number.`);
+        return null;
+    }
+
+    return {
+        colorCode: "NOC",
+        colorLabel: "No Color",
+        sizeCode: "OS",
+        quantity,
+        imageField: null,
+    };
+}
+
+function categoryMapKey(type, name) {
+    return `${type}|||${name}`.toLowerCase();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// LOAD RECORDS
+////////////////////////////////////////////////////////////////////////////////
+
+const submission = await submissionsTable.selectRecordAsync(submissionRecordId);
+
+if (!submission) {
+    throw new Error(`Could not find INVENTORY SUBMISSIONS record: ${submissionRecordId}`);
+}
+
+const submissionName = submission.getCellValueAsString(SUB.submissionId) || submission.id;
+const productTypeRaw = getSingleSelectName(submission, SUB.productType);
+const parentCategory = submission.getCellValueAsString(SUB.parentCategory);
+const subcategory = submission.getCellValueAsString(SUB.subcategory);
+const designIds = getLinkedRecordIds(submission, SUB.design);
+const productionLocationIds = getLinkedRecordIds(submission, SUB.productionLocation);
+const unitPrice = submission.getCellValue(SUB.unitPrice);
+const unitCost = submission.getCellValue(SUB.unitCost);
+
+const warnings = [];
+const errors = [];
+
+////////////////////////////////////////////////////////////////////////////////
+// VALIDATE SUBMISSION BASICS
+////////////////////////////////////////////////////////////////////////////////
+
+if (!productTypeRaw) {
+    errors.push("Product Type is required.");
+}
+
+const productMap = PRODUCT_TYPE_MAP[productTypeRaw];
+
+if (!productMap) {
+    errors.push(`Unsupported Product Type: "${productTypeRaw}". Add this Product Type to the script map before parsing.`);
+}
+
+if (!parentCategory) {
+    errors.push("Parent Category formula is blank.");
+}
+
+if (!subcategory) {
+    errors.push("Subcategory formula is blank.");
+}
+
+if (productionLocationIds.length !== 1) {
+    errors.push(`Production Location must contain exactly one linked location. Found ${productionLocationIds.length}.`);
+}
+
+const isPass = parentCategory === "Passes" && subcategory === "N/A";
+const requiresDesign = !isPass;
+
+if (requiresDesign && designIds.length !== 1) {
+    errors.push(`Design must contain exactly one linked design for non-pass inventory. Found ${designIds.length}.`);
+}
+
+if (!requiresDesign && designIds.length > 1) {
+    errors.push(`Pass submissions may have zero or one linked Design. Found ${designIds.length}.`);
+}
+
+if (unitPrice === null || unitPrice === undefined) {
+    warnings.push("Unit Price is blank.");
+}
+
+if (unitCost === null || unitCost === undefined) {
+    warnings.push("Unit Cost is blank.");
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// LOAD CATEGORY MAPS FOR VALIDATION / LINKING
+////////////////////////////////////////////////////////////////////////////////
+
+const categoryMapQuery = await categoryMapTable.selectRecordsAsync({
+    fields: [
+        CATMAP.categoryType,
+        CATMAP.categoryName,
+        CATMAP.processorCategoryId,
+        CATMAP.syncStatus,
+        CATMAP.catalogProcessor,
+        CATMAP.processorEnvironment,
+    ],
+});
+
+const categoryMapByTypeAndName = new Map();
+
+for (const record of categoryMapQuery.records) {
+    const categoryType = getSingleSelectName(record, CATMAP.categoryType);
+    const categoryName = record.getCellValueAsString(CATMAP.categoryName);
+    const processorCategoryId = record.getCellValueAsString(CATMAP.processorCategoryId);
+    const syncStatus = getSingleSelectName(record, CATMAP.syncStatus);
+    const catalogProcessor = getSingleSelectName(record, CATMAP.catalogProcessor);
+    const processorEnvironment = getSingleSelectName(record, CATMAP.processorEnvironment);
+
+    if (!categoryType || !categoryName) continue;
+
+    const isProductionSquare =
+        (!catalogProcessor || catalogProcessor === "SQUARE") &&
+        (!processorEnvironment || processorEnvironment === "PRODUCTION");
+
+    if (!isProductionSquare) continue;
+
+    categoryMapByTypeAndName.set(categoryMapKey(categoryType, categoryName), {
+        id: record.id,
+        categoryType,
+        categoryName,
+        processorCategoryId,
+        syncStatus,
+    });
+}
+
+let matchedCategoryMap = null;
+
+if (subcategory === "N/A" && parentCategory === "Passes") {
+    matchedCategoryMap = categoryMapByTypeAndName.get(categoryMapKey("Parent Category", "Passes")) || null;
+} else {
+    matchedCategoryMap = categoryMapByTypeAndName.get(categoryMapKey("Subcategory", subcategory)) || null;
+}
+
+if (!matchedCategoryMap) {
+    warnings.push(`No PROCESSOR CATEGORY MAP match found for ${subcategory === "N/A" ? parentCategory : subcategory}.`);
+} else if (!matchedCategoryMap.processorCategoryId || matchedCategoryMap.syncStatus !== "SYNCED") {
+    warnings.push(
+        `PROCESSOR CATEGORY MAP found for ${matchedCategoryMap.categoryName}, but it is not fully synced. Sync Status: ${matchedCategoryMap.syncStatus || "blank"}.`
+    );
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// BUILD QUANTITY ENTRIES
+////////////////////////////////////////////////////////////////////////////////
+
+const entries = [];
+
+for (const bucket of COLOR_BUCKETS) {
+    entries.push(...positiveQuantityEntriesForBucket(submission, bucket, errors));
+}
+
+const nocEntry = positiveNocEntry(submission, errors);
+if (nocEntry) entries.push(nocEntry);
+
+if (entries.length === 0) {
+    errors.push("No positive quantity fields were found to parse.");
+}
+
+if (!isPass) {
+    const invalidNoc = entries.find((entry) => entry.colorCode === "NOC");
+    if (invalidNoc) {
+        warnings.push("NOC OS Qty is present on a non-pass submission. This will still parse, but should be reviewed.");
+    }
+}
+
+if (isPass) {
+    const nonNocEntries = entries.filter((entry) => entry.colorCode !== "NOC");
+    if (nonNocEntries.length > 0) {
+        warnings.push("Pass submission includes BLK/WHT/GRY/COL quantities. These will parse, but should be reviewed.");
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// STOP ON BLOCKING ERRORS
+////////////////////////////////////////////////////////////////////////////////
+
+if (errors.length > 0) {
+    await submissionsTable.updateRecordAsync(submission.id, {
+        [SUB.parserStatus]: { name: "Failed" },
+        [SUB.status]: { name: "Needs Changes" },
+        [SUB.parserNotes]: formatDraftNotes([
+            `SUB-1 failed for ${submissionName}.`,
+            "",
+            "Errors:",
+            ...errors.map((e) => `- ${e}`),
+            "",
+            ...(warnings.length ? ["Warnings:", ...warnings.map((w) => `- ${w}`)] : []),
+        ]),
+    });
+
+    throw new Error(`SUB-1 failed for ${submissionName}: ${errors.join(" | ")}`);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// DELETE OLD DRAFT ITEMS THAT ARE SAFE TO REGENERATE
+////////////////////////////////////////////////////////////////////////////////
+
+const existingDraftIds = getLinkedRecordIds(submission, SUB.itemDrafts);
+
+let deletedCount = 0;
+let preservedCount = 0;
+
+if (existingDraftIds.length > 0) {
+    const draftQuery = await draftItemsTable.selectRecordsAsync({
+        fields: [DRAFT.draftStatus, DRAFT.inventorySubmission],
+    });
+
+    const recordsToDelete = [];
+
+    for (const draftId of existingDraftIds) {
+        const draftRecord = draftQuery.getRecord(draftId);
+        if (!draftRecord) continue;
+
+        const draftStatus = getSingleSelectName(draftRecord, DRAFT.draftStatus);
+
+        if (DRAFT_DELETE_STATUSES.has(draftStatus)) {
+            recordsToDelete.push(draftRecord.id);
+        } else {
+            preservedCount += 1;
+        }
+    }
+
+    for (const batch of chunkArray(recordsToDelete, 50)) {
+        await draftItemsTable.deleteRecordsAsync(batch);
+        deletedCount += batch.length;
+    }
+
+    if (preservedCount > 0) {
+        warnings.push(`${preservedCount} linked draft item(s) were preserved because they were no longer blank/Draft.`);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// CREATE DRAFT ITEMS
+////////////////////////////////////////////////////////////////////////////////
+
+const createPayloads = [];
+
+const designId = designIds[0] || null;
+const productionLocationId = productionLocationIds[0];
+
+let designName = "";
+let designCode = "";
+
+if (designId) {
+    // Because Design Name and Design Code are lookups on DRAFT ITEMS, the parser
+    // does not need to write those fields. We still need a code/name for SKU/item text.
+    const designsTable = base.getTable("DESIGNS");
+    const designRecord = await designsTable.selectRecordAsync(designId);
+
+    if (designRecord) {
+        designName = designRecord.getCellValueAsString("Design Name");
+        designCode = designRecord.getCellValueAsString("Design Code");
+    }
+}
+
+if (!designName && isPass) {
+    designName = "Pass";
+}
+
+if (!designCode && isPass && productMap) {
+    designCode = productMap.code;
+}
+
+if (!designName) {
+    warnings.push("Design Name could not be resolved from linked Design.");
+}
+
+if (!designCode) {
+    warnings.push("Design Code could not be resolved from linked Design.");
+}
+
+const productCode = productMap.code;
+const draftProductType = productMap.draftProductType;
+
+const seenSkus = new Set();
+
+for (const entry of entries) {
+    const draftSku = makeSku({
+        designCode,
+        productCode,
+        colorCode: entry.colorCode,
+        sizeCode: entry.sizeCode,
+    });
+
+    if (!draftSku) {
+        warnings.push(`Skipped a row because Draft SKU could not be generated for ${entry.colorCode} ${entry.sizeCode}.`);
+        continue;
+    }
+
+    if (seenSkus.has(draftSku)) {
+        warnings.push(`Duplicate Draft SKU generated within this parse: ${draftSku}. Skipping duplicate.`);
+        continue;
+    }
+
+    seenSkus.add(draftSku);
+
+    const itemName = buildItemName({
+        designName,
+        draftProductType,
+    });
+
+    const variantName = buildVariantName({
+        colorCode: entry.colorCode,
+        sizeCode: entry.sizeCode,
+    });
+
+    const imageAttachments = entry.imageField ? attachmentPayload(submission, entry.imageField) : [];
+
+    const itemWarnings = [];
+
+    if (!matchedCategoryMap) {
+        itemWarnings.push("Processor category map not found.");
+    } else if (!matchedCategoryMap.processorCategoryId || matchedCategoryMap.syncStatus !== "SYNCED") {
+        itemWarnings.push("Processor category map is not fully synced.");
+    }
+
+    if (imageAttachments.length === 0 && entry.colorCode !== "NOC") {
+        itemWarnings.push(`No image found for ${entry.colorCode}.`);
+    }
+
+    const validationStatus = itemWarnings.length > 0 || warnings.length > 0 ? "Warning" : "Valid";
+
+    createPayloads.push({
+        fields: {
+            [DRAFT.draftSku]: draftSku,
+            [DRAFT.draftStatus]: { name: "Draft" },
+            [DRAFT.inventorySubmission]: [{ id: submission.id }],
+            ...(designId ? { [DRAFT.design]: [{ id: designId }] } : {}),
+            [DRAFT.productType]: { name: draftProductType },
+            [DRAFT.parentCategory]: { name: parentCategory },
+            ...(subcategory !== "N/A" ? { [DRAFT.subcategory]: { name: subcategory } } : {}),
+            ...(matchedCategoryMap ? { [DRAFT.processorCategoryMap]: [{ id: matchedCategoryMap.id }] } : {}),
+            [DRAFT.colorFamily]: { name: entry.colorCode },
+            [DRAFT.size]: { name: entry.sizeCode },
+            [DRAFT.itemName]: itemName,
+            [DRAFT.variantName]: variantName,
+            [DRAFT.barcodeValue]: draftSku,
+            ...(unitPrice !== null && unitPrice !== undefined ? { [DRAFT.unitPrice]: unitPrice } : {}),
+            ...(unitCost !== null && unitCost !== undefined ? { [DRAFT.unitCost]: unitCost } : {}),
+            [DRAFT.startingProductionQuantity]: entry.quantity,
+            [DRAFT.productionLocation]: [{ id: productionLocationId }],
+            ...(imageAttachments.length > 0 ? { [DRAFT.productImage]: imageAttachments } : {}),
+            [DRAFT.imageGroupKey]: `${designCode || "NO-DESIGN"}-${productCode}-${entry.colorCode}`,
+            [DRAFT.validationStatus]: { name: validationStatus },
+            [DRAFT.validationNotes]: formatDraftNotes(itemWarnings),
+            [DRAFT.processingStatus]: { name: "Not Processed" },
+        },
+    });
+}
+
+let createdCount = 0;
+
+for (const batch of chunkArray(createPayloads, 50)) {
+    await draftItemsTable.createRecordsAsync(batch);
+    createdCount += batch.length;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// FINAL SUBMISSION UPDATE
+////////////////////////////////////////////////////////////////////////////////
+
+const finalParserStatus = warnings.length > 0 ? "Needs Review" : "Parsed";
+const finalSubmissionStatus = warnings.length > 0 ? "Ready for Aud Review" : "Parsed to Draft Items";
+
+await submissionsTable.updateRecordAsync(submission.id, {
+    [SUB.parserStatus]: { name: finalParserStatus },
+    [SUB.status]: { name: finalSubmissionStatus },
+    [SUB.parserNotes]: formatDraftNotes([
+        `SUB-1 completed for ${submissionName}.`,
+        `Created draft items: ${createdCount}`,
+        `Deleted old draft items: ${deletedCount}`,
+        `Preserved old draft items: ${preservedCount}`,
+        "",
+        ...(warnings.length ? ["Warnings:", ...warnings.map((w) => `- ${w}`)] : ["No warnings."]),
+    ]),
+});
+
+output.set("submissionRecordId", submission.id);
+output.set("submissionId", submissionName);
+output.set("createdDraftItemCount", createdCount);
+output.set("deletedOldDraftItemCount", deletedCount);
+output.set("preservedOldDraftItemCount", preservedCount);
+output.set("parserStatus", finalParserStatus);
+
+console.log(`SUB-1 complete for ${submissionName}. Created ${createdCount} draft item(s).`);
