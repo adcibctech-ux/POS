@@ -1,5 +1,5 @@
 ////////////////////////////////////////////////////////////////////////////////
-// SUB-1-SubmissionParser-v26.0.0
+// SUB-1-SubmissionParser-v26.0.1
 // POS Backend | INVENTORY SUBMISSIONS → DRAFT ITEMS
 //
 // PURPOSE
@@ -22,8 +22,22 @@
 //   - Negative/decimal quantities create parser errors and block parsing.
 //   - Missing category map creates warnings but does not block draft row creation.
 //
-// VERSION
+// UPDATES / BUG FIXES
+//   v26.0.1
+//   - Added support for INVENTORY SUBMISSIONS {New Product Type}.
+//   - If {New Product Type} is filled, script uses it for item naming and SKU
+//     abbreviation generation.
+//   - If {New Product Type} is filled, script writes DRAFT ITEMS {Product Type}
+//     as "ADD NEW PRODUCT TYPE" and writes the submitted value into
+//     DRAFT ITEMS {New Product Type}.
+//   - Known Product Type mapping remains unchanged when {New Product Type} is blank.
+//
 //   v26.0.0
+//   - Initial submission parser.
+//   - Parses BLK/WHT/GRY/COL quantity buckets and NOC OS Qty.
+//   - Generates DRAFT ITEMS records from INVENTORY SUBMISSIONS.
+//   - Matches synced PROCESSOR CATEGORY MAP records for validation/linking.
+//
 ////////////////////////////////////////////////////////////////////////////////
 
 const CONFIG = input.config();
@@ -50,6 +64,7 @@ const SUB = {
     status: "Submission Status",
     design: "Design",
     productType: "Product Type",
+    newProductType: "New Product Type",
     parentCategory: "Parent Category",
     subcategory: "Subcategory",
     unitPrice: "Unit Price",
@@ -119,15 +134,6 @@ const NOC_BUCKET = {
 
 const DRAFT_DELETE_STATUSES = new Set(["", "Draft"]);
 
-const FINAL_OR_REVIEW_STATUSES = new Set([
-    "Aud Reviewed",
-    "Ready for Ari Review",
-    "Needs Changes",
-    "Approved",
-    "Processed to Catalog",
-    "Rejected",
-]);
-
 ////////////////////////////////////////////////////////////////////////////////
 // PRODUCT TYPE MAPPING
 ////////////////////////////////////////////////////////////////////////////////
@@ -142,239 +148,68 @@ const PRODUCT_TYPE_MAP = {
         code: "VIPPASS",
     },
 
-    "Tops > Tee": {
-        draftProductType: "Tee",
-        code: "TEE",
-    },
-    "Tops > Long Sleeve Tee": {
-        draftProductType: "Long Sleeve Tee",
-        code: "LSTEE",
-    },
-    "Tops > Sleeveless Tank": {
-        draftProductType: "Sleeveless Tank",
-        code: "SLTANK",
-    },
-    "Tops > Men's Tank": {
-        draftProductType: "Men's Tank",
-        code: "MTANK",
-    },
-    "Tops > Ribbed Tank": {
-        draftProductType: "Ribbed Tank",
-        code: "RIBTANK",
-    },
-    "Tops > Athletic Tank": {
-        draftProductType: "Athletic Tank",
-        code: "ATHTANK",
-    },
-    "Tops > Crop Top": {
-        draftProductType: "Crop Top",
-        code: "CROP",
-    },
-    "Tops > Long Sleeve Crop Top": {
-        draftProductType: "Long Sleeve Crop Top",
-        code: "LSCROP",
-    },
-    "Tops > Dance Top": {
-        draftProductType: "Dance Top",
-        code: "DANCETOP",
-    },
+    "Tops > Tee": { draftProductType: "Tee", code: "TEE" },
+    "Tops > Long Sleeve Tee": { draftProductType: "Long Sleeve Tee", code: "LSTEE" },
+    "Tops > Sleeveless Tank": { draftProductType: "Sleeveless Tank", code: "SLTANK" },
+    "Tops > Men's Tank": { draftProductType: "Men's Tank", code: "MTANK" },
+    "Tops > Ribbed Tank": { draftProductType: "Ribbed Tank", code: "RIBTANK" },
+    "Tops > Athletic Tank": { draftProductType: "Athletic Tank", code: "ATHTANK" },
+    "Tops > Crop Top": { draftProductType: "Crop Top", code: "CROP" },
+    "Tops > Long Sleeve Crop Top": { draftProductType: "Long Sleeve Crop Top", code: "LSCROP" },
+    "Tops > Dance Top": { draftProductType: "Dance Top", code: "DANCETOP" },
 
-    "Sweatshirts > Crewneck": {
-        draftProductType: "Crewneck",
-        code: "CREW",
-    },
-    "Sweatshirts > Sweatshirt": {
-        draftProductType: "Sweatshirt",
-        code: "SWT",
-    },
-    "Sweatshirts > Hoodie": {
-        draftProductType: "Hoodie",
-        code: "HOOD",
-    },
-    "Sweatshirts > Zip Hoodie": {
-        draftProductType: "Zip Hoodie",
-        code: "ZIPHOOD",
-    },
-    "Sweatshirts > Quarter-Zip": {
-        draftProductType: "Quarter-Zip",
-        code: "QZIP",
-    },
-    "Sweatshirts > Pullover": {
-        draftProductType: "Pullover",
-        code: "PULL",
-    },
+    "Sweatshirts > Crewneck": { draftProductType: "Crewneck", code: "CREW" },
+    "Sweatshirts > Sweatshirt": { draftProductType: "Sweatshirt", code: "SWT" },
+    "Sweatshirts > Hoodie": { draftProductType: "Hoodie", code: "HOOD" },
+    "Sweatshirts > Zip Hoodie": { draftProductType: "Zip Hoodie", code: "ZIPHOOD" },
+    "Sweatshirts > Quarter-Zip": { draftProductType: "Quarter-Zip", code: "QZIP" },
+    "Sweatshirts > Pullover": { draftProductType: "Pullover", code: "PULL" },
 
-    "Outerwear > Jacket": {
-        draftProductType: "Jacket",
-        code: "JKT",
-    },
-    "Outerwear > Puffer Jacket": {
-        draftProductType: "Puffer Jacket",
-        code: "PUFFER",
-    },
-    "Outerwear > Windbreaker": {
-        draftProductType: "Windbreaker",
-        code: "WIND",
-    },
-    "Outerwear > Zip Vest": {
-        draftProductType: "Zip Vest",
-        code: "ZIPVEST",
-    },
-    "Outerwear > Fleece Vest": {
-        draftProductType: "Fleece Vest",
-        code: "FLCVEST",
-    },
-    "Outerwear > Warm-Up Jacket": {
-        draftProductType: "Warm-Up Jacket",
-        code: "WARMJKT",
-    },
+    "Outerwear > Jacket": { draftProductType: "Jacket", code: "JKT" },
+    "Outerwear > Puffer Jacket": { draftProductType: "Puffer Jacket", code: "PUFFER" },
+    "Outerwear > Windbreaker": { draftProductType: "Windbreaker", code: "WIND" },
+    "Outerwear > Zip Vest": { draftProductType: "Zip Vest", code: "ZIPVEST" },
+    "Outerwear > Fleece Vest": { draftProductType: "Fleece Vest", code: "FLCVEST" },
+    "Outerwear > Warm-Up Jacket": { draftProductType: "Warm-Up Jacket", code: "WARMJKT" },
 
-    "Bottoms > Shorts": {
-        draftProductType: "Shorts",
-        code: "SHORTS",
-    },
-    "Bottoms > Sweatshorts": {
-        draftProductType: "Sweatshorts",
-        code: "SWTSHRT",
-    },
-    "Bottoms > Pants": {
-        draftProductType: "Pants",
-        code: "PANTS",
-    },
-    "Bottoms > Sweatpants": {
-        draftProductType: "Sweatpants",
-        code: "SWTPANT",
-    },
-    "Bottoms > Joggers": {
-        draftProductType: "Joggers",
-        code: "JOGGER",
-    },
-    "Bottoms > Leggings": {
-        draftProductType: "Leggings",
-        code: "LEGG",
-    },
-    "Bottoms > Dance Pants": {
-        draftProductType: "Dance Pants",
-        code: "DNCPANT",
-    },
-    "Bottoms > Warm-Up Pants": {
-        draftProductType: "Warm-Up Pants",
-        code: "WARMPANT",
-    },
+    "Bottoms > Shorts": { draftProductType: "Shorts", code: "SHORTS" },
+    "Bottoms > Sweatshorts": { draftProductType: "Sweatshorts", code: "SWTSHRT" },
+    "Bottoms > Pants": { draftProductType: "Pants", code: "PANTS" },
+    "Bottoms > Sweatpants": { draftProductType: "Sweatpants", code: "SWTPANT" },
+    "Bottoms > Joggers": { draftProductType: "Joggers", code: "JOGGER" },
+    "Bottoms > Leggings": { draftProductType: "Leggings", code: "LEGG" },
+    "Bottoms > Dance Pants": { draftProductType: "Dance Pants", code: "DNCPANT" },
+    "Bottoms > Warm-Up Pants": { draftProductType: "Warm-Up Pants", code: "WARMPANT" },
 
-    "Dancewear > Leotard": {
-        draftProductType: "Leotard",
-        code: "LEO",
-    },
-    "Dancewear > Dance Skirt": {
-        draftProductType: "Dance Skirt",
-        code: "DNSKIRT",
-    },
-    "Dancewear > Pull-On Skirt": {
-        draftProductType: "Pull-On Skirt",
-        code: "POSKIRT",
-    },
-    "Dancewear > Wrap Skirt": {
-        draftProductType: "Wrap Skirt",
-        code: "WRAPSKRT",
-    },
-    "Dancewear > Ballet Skirt": {
-        draftProductType: "Ballet Skirt",
-        code: "BALSKIRT",
-    },
-    "Dancewear > Unitard": {
-        draftProductType: "Unitard",
-        code: "UNITARD",
-    },
-    "Dancewear > Sports Bra": {
-        draftProductType: "Sports Bra",
-        code: "SPBRA",
-    },
-    "Dancewear > Dance Shorts": {
-        draftProductType: "Dance Shorts",
-        code: "DNCSHRT",
-    },
-    "Dancewear > Dance Dress": {
-        draftProductType: "Dance Dress",
-        code: "DNCDRESS",
-    },
-    "Dancewear > Tights": {
-        draftProductType: "Tights",
-        code: "TIGHTS",
-    },
+    "Dancewear > Leotard": { draftProductType: "Leotard", code: "LEO" },
+    "Dancewear > Dance Skirt": { draftProductType: "Dance Skirt", code: "DNSKIRT" },
+    "Dancewear > Pull-On Skirt": { draftProductType: "Pull-On Skirt", code: "POSKIRT" },
+    "Dancewear > Wrap Skirt": { draftProductType: "Wrap Skirt", code: "WRAPSKRT" },
+    "Dancewear > Ballet Skirt": { draftProductType: "Ballet Skirt", code: "BALSKIRT" },
+    "Dancewear > Unitard": { draftProductType: "Unitard", code: "UNITARD" },
+    "Dancewear > Sports Bra": { draftProductType: "Sports Bra", code: "SPBRA" },
+    "Dancewear > Dance Shorts": { draftProductType: "Dance Shorts", code: "DNCSHRT" },
+    "Dancewear > Dance Dress": { draftProductType: "Dance Dress", code: "DNCDRESS" },
+    "Dancewear > Tights": { draftProductType: "Tights", code: "TIGHTS" },
 
-    "Accessories > Tote Bag": {
-        draftProductType: "Tote Bag",
-        code: "TOTE",
-    },
-    "Accessories > Backpack": {
-        draftProductType: "Backpack",
-        code: "BPACK",
-    },
-    "Accessories > Duffel Bag": {
-        draftProductType: "Duffel Bag",
-        code: "DUFFEL",
-    },
-    "Accessories > Makeup Bag": {
-        draftProductType: "Makeup Bag",
-        code: "MUBAG",
-    },
-    "Accessories > Water Bottle": {
-        draftProductType: "Water Bottle",
-        code: "BOTTLE",
-    },
-    "Accessories > Tumbler": {
-        draftProductType: "Tumbler",
-        code: "TUMBLR",
-    },
-    "Accessories > Sticker": {
-        draftProductType: "Sticker",
-        code: "STICKR",
-    },
-    "Accessories > Patch": {
-        draftProductType: "Patch",
-        code: "PATCH",
-    },
-    "Accessories > Pin": {
-        draftProductType: "Pin",
-        code: "PIN",
-    },
-    "Accessories > Keychain": {
-        draftProductType: "Keychain",
-        code: "KEYCHN",
-    },
-    "Accessories > Lanyard": {
-        draftProductType: "Lanyard",
-        code: "LNYRD",
-    },
-    "Accessories > Hair Bow": {
-        draftProductType: "Hair Bow",
-        code: "BOW",
-    },
-    "Accessories > Headband": {
-        draftProductType: "Headband",
-        code: "HDBAND",
-    },
-    "Accessories > Beanie": {
-        draftProductType: "Beanie",
-        code: "BEANIE",
-    },
-    "Accessories > Hat": {
-        draftProductType: "Hat",
-        code: "HAT",
-    },
-    "Accessories > Socks": {
-        draftProductType: "Socks",
-        code: "SOCKS",
-    },
-    "Accessories > Towel": {
-        draftProductType: "Towel",
-        code: "TOWEL",
-    },
-    "Accessories > Notebook": {
-        draftProductType: "Notebook",
-        code: "NOTE",
-    },
+    "Accessories > Tote Bag": { draftProductType: "Tote Bag", code: "TOTE" },
+    "Accessories > Backpack": { draftProductType: "Backpack", code: "BPACK" },
+    "Accessories > Duffel Bag": { draftProductType: "Duffel Bag", code: "DUFFEL" },
+    "Accessories > Makeup Bag": { draftProductType: "Makeup Bag", code: "MUBAG" },
+    "Accessories > Water Bottle": { draftProductType: "Water Bottle", code: "BOTTLE" },
+    "Accessories > Tumbler": { draftProductType: "Tumbler", code: "TUMBLR" },
+    "Accessories > Sticker": { draftProductType: "Sticker", code: "STICKR" },
+    "Accessories > Patch": { draftProductType: "Patch", code: "PATCH" },
+    "Accessories > Pin": { draftProductType: "Pin", code: "PIN" },
+    "Accessories > Keychain": { draftProductType: "Keychain", code: "KEYCHN" },
+    "Accessories > Lanyard": { draftProductType: "Lanyard", code: "LNYRD" },
+    "Accessories > Hair Bow": { draftProductType: "Hair Bow", code: "BOW" },
+    "Accessories > Headband": { draftProductType: "Headband", code: "HDBAND" },
+    "Accessories > Beanie": { draftProductType: "Beanie", code: "BEANIE" },
+    "Accessories > Hat": { draftProductType: "Hat", code: "HAT" },
+    "Accessories > Socks": { draftProductType: "Socks", code: "SOCKS" },
+    "Accessories > Towel": { draftProductType: "Towel", code: "TOWEL" },
+    "Accessories > Notebook": { draftProductType: "Notebook", code: "NOTE" },
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -390,24 +225,6 @@ function getLinkedRecordIds(record, fieldName) {
     const value = record.getCellValue(fieldName);
     if (!Array.isArray(value)) return [];
     return value.map((linked) => linked.id);
-}
-
-function getLookupTexts(record, fieldName) {
-    const value = record.getCellValue(fieldName);
-    if (!Array.isArray(value)) return [];
-    return value
-        .map((entry) => {
-            if (entry === null || entry === undefined) return "";
-            if (typeof entry === "string") return entry;
-            if (typeof entry === "number") return String(entry);
-            if (entry.name) return entry.name;
-            return String(entry);
-        })
-        .filter(Boolean);
-}
-
-function firstLookupText(record, fieldName) {
-    return getLookupTexts(record, fieldName)[0] || "";
 }
 
 function getNumber(record, fieldName) {
@@ -444,6 +261,11 @@ function normalizeCode(value) {
         .replace(/-+/g, "-");
 }
 
+function makeProductTypeCodeFromText(value) {
+    const normalized = normalizeCode(value).replace(/-/g, "");
+    return normalized.slice(0, 10);
+}
+
 function makeSku({ designCode, productCode, colorCode, sizeCode }) {
     const parts = [designCode, productCode, colorCode, sizeCode]
         .map(normalizeCode)
@@ -460,7 +282,7 @@ function buildVariantName({ colorCode, sizeCode }) {
     return `${colorCode} / ${sizeCode}`;
 }
 
-function formatDraftNotes(notes) {
+function formatNotes(notes) {
     return notes.length ? notes.join("\n") : "";
 }
 
@@ -494,7 +316,6 @@ function positiveQuantityEntriesForBucket(record, bucket, errors) {
 
         entries.push({
             colorCode: bucket.code,
-            colorLabel: bucket.label,
             sizeCode,
             quantity,
             imageField: bucket.imageField,
@@ -526,7 +347,6 @@ function positiveNocEntry(record, errors) {
 
     return {
         colorCode: "NOC",
-        colorLabel: "No Color",
         sizeCode: "OS",
         quantity,
         imageField: null,
@@ -538,7 +358,7 @@ function categoryMapKey(type, name) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// LOAD RECORDS
+// LOAD SUBMISSION
 ////////////////////////////////////////////////////////////////////////////////
 
 const submission = await submissionsTable.selectRecordAsync(submissionRecordId);
@@ -549,6 +369,7 @@ if (!submission) {
 
 const submissionName = submission.getCellValueAsString(SUB.submissionId) || submission.id;
 const productTypeRaw = getSingleSelectName(submission, SUB.productType);
+const newProductType = submission.getCellValueAsString(SUB.newProductType).trim();
 const parentCategory = submission.getCellValueAsString(SUB.parentCategory);
 const subcategory = submission.getCellValueAsString(SUB.subcategory);
 const designIds = getLinkedRecordIds(submission, SUB.design);
@@ -560,18 +381,40 @@ const warnings = [];
 const errors = [];
 
 ////////////////////////////////////////////////////////////////////////////////
-// VALIDATE SUBMISSION BASICS
+// PRODUCT TYPE RESOLUTION
 ////////////////////////////////////////////////////////////////////////////////
 
-if (!productTypeRaw) {
-    errors.push("Product Type is required.");
+let draftProductType = "";
+let productCode = "";
+let draftProductTypeSelectValue = "";
+let writeNewProductType = "";
+
+if (newProductType) {
+    draftProductType = newProductType;
+    productCode = makeProductTypeCodeFromText(newProductType);
+    draftProductTypeSelectValue = "ADD NEW PRODUCT TYPE";
+    writeNewProductType = newProductType;
+
+    if (!productCode) {
+        errors.push("New Product Type is filled, but a SKU abbreviation could not be generated from it.");
+    }
+} else {
+    const productMap = PRODUCT_TYPE_MAP[productTypeRaw];
+
+    if (!productTypeRaw) {
+        errors.push("Product Type is required.");
+    } else if (!productMap) {
+        errors.push(`Unsupported Product Type: "${productTypeRaw}". Add this Product Type to the script map or use New Product Type before parsing.`);
+    } else {
+        draftProductType = productMap.draftProductType;
+        productCode = productMap.code;
+        draftProductTypeSelectValue = productMap.draftProductType;
+    }
 }
 
-const productMap = PRODUCT_TYPE_MAP[productTypeRaw];
-
-if (!productMap) {
-    errors.push(`Unsupported Product Type: "${productTypeRaw}". Add this Product Type to the script map before parsing.`);
-}
+////////////////////////////////////////////////////////////////////////////////
+// VALIDATE SUBMISSION BASICS
+////////////////////////////////////////////////////////////////////////////////
 
 if (!parentCategory) {
     errors.push("Parent Category formula is blank.");
@@ -602,6 +445,10 @@ if (unitPrice === null || unitPrice === undefined) {
 
 if (unitCost === null || unitCost === undefined) {
     warnings.push("Unit Cost is blank.");
+}
+
+if (newProductType && productTypeRaw !== "ADD NEW PRODUCT TYPE") {
+    warnings.push(`New Product Type is filled and will override Product Type for naming/SKU generation. Product Type selected: "${productTypeRaw || "blank"}".`);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -701,7 +548,7 @@ if (errors.length > 0) {
     await submissionsTable.updateRecordAsync(submission.id, {
         [SUB.parserStatus]: { name: "Failed" },
         [SUB.status]: { name: "Needs Changes" },
-        [SUB.parserNotes]: formatDraftNotes([
+        [SUB.parserNotes]: formatNotes([
             `SUB-1 failed for ${submissionName}.`,
             "",
             "Errors:",
@@ -754,10 +601,8 @@ if (existingDraftIds.length > 0) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
-// CREATE DRAFT ITEMS
+// RESOLVE DESIGN INFO
 ////////////////////////////////////////////////////////////////////////////////
-
-const createPayloads = [];
 
 const designId = designIds[0] || null;
 const productionLocationId = productionLocationIds[0];
@@ -766,8 +611,6 @@ let designName = "";
 let designCode = "";
 
 if (designId) {
-    // Because Design Name and Design Code are lookups on DRAFT ITEMS, the parser
-    // does not need to write those fields. We still need a code/name for SKU/item text.
     const designsTable = base.getTable("DESIGNS");
     const designRecord = await designsTable.selectRecordAsync(designId);
 
@@ -781,8 +624,8 @@ if (!designName && isPass) {
     designName = "Pass";
 }
 
-if (!designCode && isPass && productMap) {
-    designCode = productMap.code;
+if (!designCode && isPass) {
+    designCode = productCode;
 }
 
 if (!designName) {
@@ -793,9 +636,11 @@ if (!designCode) {
     warnings.push("Design Code could not be resolved from linked Design.");
 }
 
-const productCode = productMap.code;
-const draftProductType = productMap.draftProductType;
+////////////////////////////////////////////////////////////////////////////////
+// CREATE DRAFT ITEMS
+////////////////////////////////////////////////////////////////////////////////
 
+const createPayloads = [];
 const seenSkus = new Set();
 
 for (const entry of entries) {
@@ -850,7 +695,8 @@ for (const entry of entries) {
             [DRAFT.draftStatus]: { name: "Draft" },
             [DRAFT.inventorySubmission]: [{ id: submission.id }],
             ...(designId ? { [DRAFT.design]: [{ id: designId }] } : {}),
-            [DRAFT.productType]: { name: draftProductType },
+            [DRAFT.productType]: { name: draftProductTypeSelectValue },
+            ...(writeNewProductType ? { [DRAFT.newProductType]: writeNewProductType } : {}),
             [DRAFT.parentCategory]: { name: parentCategory },
             ...(subcategory !== "N/A" ? { [DRAFT.subcategory]: { name: subcategory } } : {}),
             ...(matchedCategoryMap ? { [DRAFT.processorCategoryMap]: [{ id: matchedCategoryMap.id }] } : {}),
@@ -866,7 +712,7 @@ for (const entry of entries) {
             ...(imageAttachments.length > 0 ? { [DRAFT.productImage]: imageAttachments } : {}),
             [DRAFT.imageGroupKey]: `${designCode || "NO-DESIGN"}-${productCode}-${entry.colorCode}`,
             [DRAFT.validationStatus]: { name: validationStatus },
-            [DRAFT.validationNotes]: formatDraftNotes(itemWarnings),
+            [DRAFT.validationNotes]: formatNotes(itemWarnings),
             [DRAFT.processingStatus]: { name: "Not Processed" },
         },
     });
@@ -889,12 +735,20 @@ const finalSubmissionStatus = warnings.length > 0 ? "Ready for Aud Review" : "Pa
 await submissionsTable.updateRecordAsync(submission.id, {
     [SUB.parserStatus]: { name: finalParserStatus },
     [SUB.status]: { name: finalSubmissionStatus },
-    [SUB.parserNotes]: formatDraftNotes([
+    [SUB.parserNotes]: formatNotes([
         `SUB-1 completed for ${submissionName}.`,
         `Created draft items: ${createdCount}`,
         `Deleted old draft items: ${deletedCount}`,
         `Preserved old draft items: ${preservedCount}`,
         "",
+        ...(newProductType
+            ? [
+                  "New Product Type:",
+                  `- ${newProductType}`,
+                  `- Generated Product Type Code: ${productCode}`,
+                  "",
+              ]
+            : []),
         ...(warnings.length ? ["Warnings:", ...warnings.map((w) => `- ${w}`)] : ["No warnings."]),
     ]),
 });
@@ -905,5 +759,7 @@ output.set("createdDraftItemCount", createdCount);
 output.set("deletedOldDraftItemCount", deletedCount);
 output.set("preservedOldDraftItemCount", preservedCount);
 output.set("parserStatus", finalParserStatus);
+output.set("newProductType", newProductType || "");
+output.set("generatedProductTypeCode", newProductType ? productCode : "");
 
 console.log(`SUB-1 complete for ${submissionName}. Created ${createdCount} draft item(s).`);
