@@ -1,5 +1,5 @@
 ////////////////////////////////////////////////////////////////////////////////
-// SUB-1-SubmissionParser-v26.0.1
+// SUB-1-SubmissionParser-v26.1.0
 // POS Backend | INVENTORY SUBMISSIONS → DRAFT ITEMS
 //
 // PURPOSE
@@ -11,32 +11,41 @@
 //   submissionRecordId
 //
 // RECOMMENDED TRIGGER
-//   When INVENTORY SUBMISSIONS record enters view:
-//   - Parser Status = Not Parsed, blank, or Failed/Needs Review and ready to retry
-//   - Submission Status = Draft or Ready for Aud Review, depending your workflow
+//   When INVENTORY SUBMISSIONS record enters parsing-ready view:
+//   - Parser Status = Not Parsed or blank
+//   - Submission Status = Draft / submitted state
+//   - PRODUCT TYPES is populated
 //
 // SAFETY BEHAVIOR
 //   - Deletes old linked draft items ONLY when Draft Status is blank or "Draft".
 //   - Preserves old draft items that have moved into review/approval/processed states.
 //   - Creates one DRAFT ITEMS row per positive quantity field.
 //   - Negative/decimal quantities create parser errors and block parsing.
-//   - Missing category map creates warnings but does not block draft row creation.
+//   - New/unapproved PRODUCT TYPES create warnings in DRAFT ITEMS.
+//   - Missing/unsynced processor category maps create warnings.
 //
 // UPDATES / BUG FIXES
+//   v26.1.0
+//   - Major revision: PRODUCT TYPES linked records are now the source of truth.
+//   - Ignores legacy INVENTORY SUBMISSIONS {Product Type} single select entirely.
+//   - Ignores legacy DRAFT ITEMS {Product Type} single select entirely.
+//   - Reads Product Type Name, Product Type Code, Parent Category, Subcategory,
+//     and Product Type Status from linked PRODUCT TYPES record.
+//   - Writes linked DRAFT ITEMS {PRODUCT TYPES} instead of old Product Type select.
+//   - Flags PRODUCT TYPES records that are not Approved.
+//   - Uses PRODUCT TYPES linked category records to determine parent/subcategory
+//     text and processor category map linkage.
+//   - Supports Passes with Parent Category = Passes and no Subcategory.
+//   - Keeps NOC/OS pass behavior from earlier versions.
+//
 //   v26.0.1
 //   - Added support for INVENTORY SUBMISSIONS {New Product Type}.
-//   - If {New Product Type} is filled, script uses it for item naming and SKU
-//     abbreviation generation.
-//   - If {New Product Type} is filled, script writes DRAFT ITEMS {Product Type}
-//     as "ADD NEW PRODUCT TYPE" and writes the submitted value into
-//     DRAFT ITEMS {New Product Type}.
-//   - Known Product Type mapping remains unchanged when {New Product Type} is blank.
+//   - Superseded by v26.1.0 linked PRODUCT TYPES architecture.
 //
 //   v26.0.0
 //   - Initial submission parser.
-//   - Parses BLK/WHT/GRY/COL quantity buckets and NOC OS Qty.
-//   - Generates DRAFT ITEMS records from INVENTORY SUBMISSIONS.
-//   - Matches synced PROCESSOR CATEGORY MAP records for validation/linking.
+//   - Parsed BLK/WHT/GRY/COL quantity buckets and NOC OS Qty.
+//   - Generated DRAFT ITEMS records from INVENTORY SUBMISSIONS.
 //
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -53,7 +62,9 @@ if (!submissionRecordId) {
 
 const submissionsTable = base.getTable("INVENTORY SUBMISSIONS");
 const draftItemsTable = base.getTable("DRAFT ITEMS");
+const productTypesTable = base.getTable("PRODUCT TYPES");
 const categoryMapTable = base.getTable("PROCESSOR CATEGORY MAP");
+const designsTable = base.getTable("DESIGNS");
 
 ////////////////////////////////////////////////////////////////////////////////
 // FIELD NAMES
@@ -63,10 +74,7 @@ const SUB = {
     submissionId: "Submission ID",
     status: "Submission Status",
     design: "Design",
-    productType: "Product Type",
-    newProductType: "New Product Type",
-    parentCategory: "Parent Category",
-    subcategory: "Subcategory",
+    productTypes: "PRODUCT TYPES",
     unitPrice: "Unit Price",
     unitCost: "Unit Cost",
     productionLocation: "Production Location",
@@ -80,10 +88,7 @@ const DRAFT = {
     draftStatus: "Draft Status",
     inventorySubmission: "Inventory Submission",
     design: "Design",
-    designName: "Design Name",
-    designCode: "Design Code",
-    productType: "Product Type",
-    newProductType: "New Product Type",
+    productTypes: "PRODUCT TYPES",
     parentCategory: "Parent Category",
     subcategory: "Subcategory",
     processorCategoryMap: "Processor Category Map",
@@ -103,6 +108,14 @@ const DRAFT = {
     processingStatus: "Processing Status",
 };
 
+const PRODUCT = {
+    name: "Product Type Name",
+    code: "Product Type Code",
+    parentCategory: "Parent Category",
+    subcategory: "Subcategory",
+    status: "Product Type Status",
+};
+
 const CATMAP = {
     categoryType: "Airtable Category Type",
     categoryName: "Airtable Category Name",
@@ -112,105 +125,31 @@ const CATMAP = {
     processorEnvironment: "Processor Environment",
 };
 
+const DESIGN = {
+    name: "Design Name",
+    code: "Design Code",
+};
+
 ////////////////////////////////////////////////////////////////////////////////
 // CONSTANTS
 ////////////////////////////////////////////////////////////////////////////////
 
 const COLOR_BUCKETS = [
-    { code: "BLK", label: "Black", imageField: "BLK Image" },
-    { code: "WHT", label: "White", imageField: "WHT Image" },
-    { code: "GRY", label: "Grey", imageField: "GRY Image" },
-    { code: "COL", label: "Color", imageField: "COL Image" },
+    { code: "BLK", imageField: "BLK Image" },
+    { code: "WHT", imageField: "WHT Image" },
+    { code: "GRY", imageField: "GRY Image" },
+    { code: "COL", imageField: "COL Image" },
 ];
 
 const SIZE_CODES = ["OS", "YS", "YM", "YL", "XS", "SM", "MD", "LG", "XL", "2X", "3X"];
 
 const NOC_BUCKET = {
     code: "NOC",
-    label: "No Color",
     size: "OS",
     qtyField: "NOC OS Qty",
 };
 
 const DRAFT_DELETE_STATUSES = new Set(["", "Draft"]);
-
-////////////////////////////////////////////////////////////////////////////////
-// PRODUCT TYPE MAPPING
-////////////////////////////////////////////////////////////////////////////////
-
-const PRODUCT_TYPE_MAP = {
-    "Admin > REGIONALS Teacher Pass": {
-        draftProductType: "REGIONALS Teacher Pass",
-        code: "REGPASS",
-    },
-    "Admin > FINALS VIP Pass": {
-        draftProductType: "FINALS VIP Pass",
-        code: "VIPPASS",
-    },
-
-    "Tops > Tee": { draftProductType: "Tee", code: "TEE" },
-    "Tops > Long Sleeve Tee": { draftProductType: "Long Sleeve Tee", code: "LSTEE" },
-    "Tops > Sleeveless Tank": { draftProductType: "Sleeveless Tank", code: "SLTANK" },
-    "Tops > Men's Tank": { draftProductType: "Men's Tank", code: "MTANK" },
-    "Tops > Ribbed Tank": { draftProductType: "Ribbed Tank", code: "RIBTANK" },
-    "Tops > Athletic Tank": { draftProductType: "Athletic Tank", code: "ATHTANK" },
-    "Tops > Crop Top": { draftProductType: "Crop Top", code: "CROP" },
-    "Tops > Long Sleeve Crop Top": { draftProductType: "Long Sleeve Crop Top", code: "LSCROP" },
-    "Tops > Dance Top": { draftProductType: "Dance Top", code: "DANCETOP" },
-
-    "Sweatshirts > Crewneck": { draftProductType: "Crewneck", code: "CREW" },
-    "Sweatshirts > Sweatshirt": { draftProductType: "Sweatshirt", code: "SWT" },
-    "Sweatshirts > Hoodie": { draftProductType: "Hoodie", code: "HOOD" },
-    "Sweatshirts > Zip Hoodie": { draftProductType: "Zip Hoodie", code: "ZIPHOOD" },
-    "Sweatshirts > Quarter-Zip": { draftProductType: "Quarter-Zip", code: "QZIP" },
-    "Sweatshirts > Pullover": { draftProductType: "Pullover", code: "PULL" },
-
-    "Outerwear > Jacket": { draftProductType: "Jacket", code: "JKT" },
-    "Outerwear > Puffer Jacket": { draftProductType: "Puffer Jacket", code: "PUFFER" },
-    "Outerwear > Windbreaker": { draftProductType: "Windbreaker", code: "WIND" },
-    "Outerwear > Zip Vest": { draftProductType: "Zip Vest", code: "ZIPVEST" },
-    "Outerwear > Fleece Vest": { draftProductType: "Fleece Vest", code: "FLCVEST" },
-    "Outerwear > Warm-Up Jacket": { draftProductType: "Warm-Up Jacket", code: "WARMJKT" },
-
-    "Bottoms > Shorts": { draftProductType: "Shorts", code: "SHORTS" },
-    "Bottoms > Sweatshorts": { draftProductType: "Sweatshorts", code: "SWTSHRT" },
-    "Bottoms > Pants": { draftProductType: "Pants", code: "PANTS" },
-    "Bottoms > Sweatpants": { draftProductType: "Sweatpants", code: "SWTPANT" },
-    "Bottoms > Joggers": { draftProductType: "Joggers", code: "JOGGER" },
-    "Bottoms > Leggings": { draftProductType: "Leggings", code: "LEGG" },
-    "Bottoms > Dance Pants": { draftProductType: "Dance Pants", code: "DNCPANT" },
-    "Bottoms > Warm-Up Pants": { draftProductType: "Warm-Up Pants", code: "WARMPANT" },
-
-    "Dancewear > Leotard": { draftProductType: "Leotard", code: "LEO" },
-    "Dancewear > Dance Skirt": { draftProductType: "Dance Skirt", code: "DNSKIRT" },
-    "Dancewear > Pull-On Skirt": { draftProductType: "Pull-On Skirt", code: "POSKIRT" },
-    "Dancewear > Wrap Skirt": { draftProductType: "Wrap Skirt", code: "WRAPSKRT" },
-    "Dancewear > Ballet Skirt": { draftProductType: "Ballet Skirt", code: "BALSKIRT" },
-    "Dancewear > Unitard": { draftProductType: "Unitard", code: "UNITARD" },
-    "Dancewear > Sports Bra": { draftProductType: "Sports Bra", code: "SPBRA" },
-    "Dancewear > Dance Shorts": { draftProductType: "Dance Shorts", code: "DNCSHRT" },
-    "Dancewear > Dance Dress": { draftProductType: "Dance Dress", code: "DNCDRESS" },
-    "Dancewear > Tights": { draftProductType: "Tights", code: "TIGHTS" },
-
-    "Accessories > Tote Bag": { draftProductType: "Tote Bag", code: "TOTE" },
-    "Accessories > Backpack": { draftProductType: "Backpack", code: "BPACK" },
-    "Accessories > Duffel Bag": { draftProductType: "Duffel Bag", code: "DUFFEL" },
-    "Accessories > Makeup Bag": { draftProductType: "Makeup Bag", code: "MUBAG" },
-    "Accessories > Water Bottle": { draftProductType: "Water Bottle", code: "BOTTLE" },
-    "Accessories > Tumbler": { draftProductType: "Tumbler", code: "TUMBLR" },
-    "Accessories > Sticker": { draftProductType: "Sticker", code: "STICKR" },
-    "Accessories > Patch": { draftProductType: "Patch", code: "PATCH" },
-    "Accessories > Pin": { draftProductType: "Pin", code: "PIN" },
-    "Accessories > Keychain": { draftProductType: "Keychain", code: "KEYCHN" },
-    "Accessories > Lanyard": { draftProductType: "Lanyard", code: "LNYRD" },
-    "Accessories > Hair Bow": { draftProductType: "Hair Bow", code: "BOW" },
-    "Accessories > Headband": { draftProductType: "Headband", code: "HDBAND" },
-    "Accessories > Beanie": { draftProductType: "Beanie", code: "BEANIE" },
-    "Accessories > Hat": { draftProductType: "Hat", code: "HAT" },
-    "Accessories > Socks": { draftProductType: "Socks", code: "SOCKS" },
-    "Accessories > Towel": { draftProductType: "Towel", code: "TOWEL" },
-    "Accessories > Notebook": { draftProductType: "Notebook", code: "NOTE" },
-};
 
 ////////////////////////////////////////////////////////////////////////////////
 // HELPERS
@@ -233,9 +172,14 @@ function getNumber(record, fieldName) {
     return Number(value);
 }
 
+function getText(record, fieldName) {
+    return String(record.getCellValueAsString(fieldName) || "").trim();
+}
+
 function attachmentPayload(record, fieldName) {
     const value = record.getCellValue(fieldName);
     if (!Array.isArray(value) || value.length === 0) return [];
+
     return value
         .filter((attachment) => attachment.url)
         .map((attachment) => ({
@@ -261,20 +205,16 @@ function normalizeCode(value) {
         .replace(/-+/g, "-");
 }
 
-function makeProductTypeCodeFromText(value) {
-    const normalized = normalizeCode(value).replace(/-/g, "");
-    return normalized.slice(0, 10);
-}
-
 function makeSku({ designCode, productCode, colorCode, sizeCode }) {
     const parts = [designCode, productCode, colorCode, sizeCode]
         .map(normalizeCode)
         .filter(Boolean);
+
     return parts.join("-");
 }
 
-function buildItemName({ designName, draftProductType }) {
-    return [designName, draftProductType].filter(Boolean).join(" ");
+function buildItemName({ designName, productTypeName }) {
+    return [designName, productTypeName].filter(Boolean).join(" ");
 }
 
 function buildVariantName({ colorCode, sizeCode }) {
@@ -290,29 +230,44 @@ function isWholeNumber(value) {
     return Number.isInteger(value);
 }
 
+function categoryMapLabel(categoryRecord) {
+    if (!categoryRecord) return "Unknown Category";
+    const categoryType = getSingleSelectName(categoryRecord, CATMAP.categoryType);
+    const categoryName = getText(categoryRecord, CATMAP.categoryName);
+    return `${categoryType || "Unknown Type"}: ${categoryName || "Unknown Name"}`;
+}
+
+function validateQuantity(record, fieldName, errors) {
+    const quantity = getNumber(record, fieldName);
+
+    if (quantity === null || quantity === 0) return null;
+
+    if (!Number.isFinite(quantity)) {
+        errors.push(`${fieldName}: quantity is not a valid number.`);
+        return null;
+    }
+
+    if (quantity < 0) {
+        errors.push(`${fieldName}: quantity cannot be negative.`);
+        return null;
+    }
+
+    if (!isWholeNumber(quantity)) {
+        errors.push(`${fieldName}: quantity must be a whole number.`);
+        return null;
+    }
+
+    return quantity;
+}
+
 function positiveQuantityEntriesForBucket(record, bucket, errors) {
     const entries = [];
 
     for (const sizeCode of SIZE_CODES) {
         const fieldName = `${bucket.code} ${sizeCode} Qty`;
-        const quantity = getNumber(record, fieldName);
+        const quantity = validateQuantity(record, fieldName, errors);
 
-        if (quantity === null || quantity === 0) continue;
-
-        if (!Number.isFinite(quantity)) {
-            errors.push(`${fieldName}: quantity is not a valid number.`);
-            continue;
-        }
-
-        if (quantity < 0) {
-            errors.push(`${fieldName}: quantity cannot be negative.`);
-            continue;
-        }
-
-        if (!isWholeNumber(quantity)) {
-            errors.push(`${fieldName}: quantity must be a whole number.`);
-            continue;
-        }
+        if (quantity === null) continue;
 
         entries.push({
             colorCode: bucket.code,
@@ -326,24 +281,9 @@ function positiveQuantityEntriesForBucket(record, bucket, errors) {
 }
 
 function positiveNocEntry(record, errors) {
-    const quantity = getNumber(record, NOC_BUCKET.qtyField);
+    const quantity = validateQuantity(record, NOC_BUCKET.qtyField, errors);
 
-    if (quantity === null || quantity === 0) return null;
-
-    if (!Number.isFinite(quantity)) {
-        errors.push(`${NOC_BUCKET.qtyField}: quantity is not a valid number.`);
-        return null;
-    }
-
-    if (quantity < 0) {
-        errors.push(`${NOC_BUCKET.qtyField}: quantity cannot be negative.`);
-        return null;
-    }
-
-    if (!isWholeNumber(quantity)) {
-        errors.push(`${NOC_BUCKET.qtyField}: quantity must be a whole number.`);
-        return null;
-    }
+    if (quantity === null) return null;
 
     return {
         colorCode: "NOC",
@@ -351,10 +291,6 @@ function positiveNocEntry(record, errors) {
         quantity,
         imageField: null,
     };
-}
-
-function categoryMapKey(type, name) {
-    return `${type}|||${name}`.toLowerCase();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -367,12 +303,9 @@ if (!submission) {
     throw new Error(`Could not find INVENTORY SUBMISSIONS record: ${submissionRecordId}`);
 }
 
-const submissionName = submission.getCellValueAsString(SUB.submissionId) || submission.id;
-const productTypeRaw = getSingleSelectName(submission, SUB.productType);
-const newProductType = submission.getCellValueAsString(SUB.newProductType).trim();
-const parentCategory = submission.getCellValueAsString(SUB.parentCategory);
-const subcategory = submission.getCellValueAsString(SUB.subcategory);
+const submissionName = getText(submission, SUB.submissionId) || submission.id;
 const designIds = getLinkedRecordIds(submission, SUB.design);
+const productTypeIds = getLinkedRecordIds(submission, SUB.productTypes);
 const productionLocationIds = getLinkedRecordIds(submission, SUB.productionLocation);
 const unitPrice = submission.getCellValue(SUB.unitPrice);
 const unitCost = submission.getCellValue(SUB.unitCost);
@@ -381,55 +314,122 @@ const warnings = [];
 const errors = [];
 
 ////////////////////////////////////////////////////////////////////////////////
-// PRODUCT TYPE RESOLUTION
+// VALIDATE LINKED PRODUCT TYPE
 ////////////////////////////////////////////////////////////////////////////////
 
-let draftProductType = "";
-let productCode = "";
-let draftProductTypeSelectValue = "";
-let writeNewProductType = "";
+if (productTypeIds.length !== 1) {
+    errors.push(`PRODUCT TYPES must contain exactly one linked product type. Found ${productTypeIds.length}.`);
+}
 
-if (newProductType) {
-    draftProductType = newProductType;
-    productCode = makeProductTypeCodeFromText(newProductType);
-    draftProductTypeSelectValue = "ADD NEW PRODUCT TYPE";
-    writeNewProductType = newProductType;
+let productTypeRecord = null;
+let productTypeName = "";
+let productTypeCode = "";
+let productTypeStatus = "";
+let productParentCategoryIds = [];
+let productSubcategoryIds = [];
 
-    if (!productCode) {
-        errors.push("New Product Type is filled, but a SKU abbreviation could not be generated from it.");
-    }
-} else {
-    const productMap = PRODUCT_TYPE_MAP[productTypeRaw];
+if (productTypeIds.length === 1) {
+    productTypeRecord = await productTypesTable.selectRecordAsync(productTypeIds[0]);
 
-    if (!productTypeRaw) {
-        errors.push("Product Type is required.");
-    } else if (!productMap) {
-        errors.push(`Unsupported Product Type: "${productTypeRaw}". Add this Product Type to the script map or use New Product Type before parsing.`);
+    if (!productTypeRecord) {
+        errors.push(`Linked PRODUCT TYPES record could not be loaded: ${productTypeIds[0]}`);
     } else {
-        draftProductType = productMap.draftProductType;
-        productCode = productMap.code;
-        draftProductTypeSelectValue = productMap.draftProductType;
+        productTypeName = getText(productTypeRecord, PRODUCT.name);
+        productTypeCode = getText(productTypeRecord, PRODUCT.code);
+        productTypeStatus = getSingleSelectName(productTypeRecord, PRODUCT.status);
+        productParentCategoryIds = getLinkedRecordIds(productTypeRecord, PRODUCT.parentCategory);
+        productSubcategoryIds = getLinkedRecordIds(productTypeRecord, PRODUCT.subcategory);
+
+        if (!productTypeName) {
+            errors.push("Linked PRODUCT TYPES record is missing Product Type Name.");
+        }
+
+        if (!productTypeCode) {
+            errors.push("Linked PRODUCT TYPES record is missing Product Type Code.");
+        }
+
+        if (!productTypeStatus) {
+            warnings.push("Linked PRODUCT TYPES record is missing Product Type Status.");
+        } else if (productTypeStatus !== "Approved") {
+            warnings.push(`Product Type "${productTypeName || productTypeRecord.name}" is not Approved. Current status: ${productTypeStatus}.`);
+        }
+
+        if (productParentCategoryIds.length !== 1) {
+            errors.push(`PRODUCT TYPES {Parent Category} must contain exactly one linked category map. Found ${productParentCategoryIds.length}.`);
+        }
+
+        if (productSubcategoryIds.length > 1) {
+            errors.push(`PRODUCT TYPES {Subcategory} may contain zero or one linked category map. Found ${productSubcategoryIds.length}.`);
+        }
     }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// LOAD PRODUCT TYPE CATEGORY MAPS
+////////////////////////////////////////////////////////////////////////////////
+
+let parentCategoryRecord = null;
+let subcategoryRecord = null;
+
+if (productParentCategoryIds.length === 1) {
+    parentCategoryRecord = await categoryMapTable.selectRecordAsync(productParentCategoryIds[0]);
+    if (!parentCategoryRecord) {
+        errors.push(`Linked Parent Category map could not be loaded: ${productParentCategoryIds[0]}`);
+    }
+}
+
+if (productSubcategoryIds.length === 1) {
+    subcategoryRecord = await categoryMapTable.selectRecordAsync(productSubcategoryIds[0]);
+    if (!subcategoryRecord) {
+        errors.push(`Linked Subcategory map could not be loaded: ${productSubcategoryIds[0]}`);
+    }
+}
+
+let parentCategoryName = "";
+let subcategoryName = "";
+let parentCategoryType = "";
+let subcategoryType = "";
+
+if (parentCategoryRecord) {
+    parentCategoryType = getSingleSelectName(parentCategoryRecord, CATMAP.categoryType);
+    parentCategoryName = getText(parentCategoryRecord, CATMAP.categoryName);
+
+    if (parentCategoryType !== "Parent Category") {
+        warnings.push(`Linked PRODUCT TYPES Parent Category is not marked as Airtable Category Type = Parent Category. Found: ${parentCategoryType || "blank"}.`);
+    }
+
+    if (!parentCategoryName) {
+        errors.push("Linked Parent Category map is missing Airtable Category Name.");
+    }
+}
+
+if (subcategoryRecord) {
+    subcategoryType = getSingleSelectName(subcategoryRecord, CATMAP.categoryType);
+    subcategoryName = getText(subcategoryRecord, CATMAP.categoryName);
+
+    if (subcategoryType !== "Subcategory") {
+        warnings.push(`Linked PRODUCT TYPES Subcategory is not marked as Airtable Category Type = Subcategory. Found: ${subcategoryType || "blank"}.`);
+    }
+
+    if (!subcategoryName) {
+        errors.push("Linked Subcategory map is missing Airtable Category Name.");
+    }
+}
+
+const isPass = parentCategoryName === "Passes" && productSubcategoryIds.length === 0;
+const requiresDesign = !isPass;
+
+if (!isPass && productSubcategoryIds.length !== 1) {
+    errors.push("Non-pass product types must have exactly one linked Subcategory.");
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 // VALIDATE SUBMISSION BASICS
 ////////////////////////////////////////////////////////////////////////////////
 
-if (!parentCategory) {
-    errors.push("Parent Category formula is blank.");
-}
-
-if (!subcategory) {
-    errors.push("Subcategory formula is blank.");
-}
-
 if (productionLocationIds.length !== 1) {
     errors.push(`Production Location must contain exactly one linked location. Found ${productionLocationIds.length}.`);
 }
-
-const isPass = parentCategory === "Passes" && subcategory === "N/A";
-const requiresDesign = !isPass;
 
 if (requiresDesign && designIds.length !== 1) {
     errors.push(`Design must contain exactly one linked design for non-pass inventory. Found ${designIds.length}.`);
@@ -447,66 +447,32 @@ if (unitCost === null || unitCost === undefined) {
     warnings.push("Unit Cost is blank.");
 }
 
-if (newProductType && productTypeRaw !== "ADD NEW PRODUCT TYPE") {
-    warnings.push(`New Product Type is filled and will override Product Type for naming/SKU generation. Product Type selected: "${productTypeRaw || "blank"}".`);
-}
-
 ////////////////////////////////////////////////////////////////////////////////
-// LOAD CATEGORY MAPS FOR VALIDATION / LINKING
+// VALIDATE PROCESSOR CATEGORY MAP SYNC STATUS
 ////////////////////////////////////////////////////////////////////////////////
 
-const categoryMapQuery = await categoryMapTable.selectRecordsAsync({
-    fields: [
-        CATMAP.categoryType,
-        CATMAP.categoryName,
-        CATMAP.processorCategoryId,
-        CATMAP.syncStatus,
-        CATMAP.catalogProcessor,
-        CATMAP.processorEnvironment,
-    ],
-});
+const processorCategoryRecord = isPass ? parentCategoryRecord : subcategoryRecord;
 
-const categoryMapByTypeAndName = new Map();
-
-for (const record of categoryMapQuery.records) {
-    const categoryType = getSingleSelectName(record, CATMAP.categoryType);
-    const categoryName = record.getCellValueAsString(CATMAP.categoryName);
-    const processorCategoryId = record.getCellValueAsString(CATMAP.processorCategoryId);
-    const syncStatus = getSingleSelectName(record, CATMAP.syncStatus);
-    const catalogProcessor = getSingleSelectName(record, CATMAP.catalogProcessor);
-    const processorEnvironment = getSingleSelectName(record, CATMAP.processorEnvironment);
-
-    if (!categoryType || !categoryName) continue;
-
-    const isProductionSquare =
-        (!catalogProcessor || catalogProcessor === "SQUARE") &&
-        (!processorEnvironment || processorEnvironment === "PRODUCTION");
-
-    if (!isProductionSquare) continue;
-
-    categoryMapByTypeAndName.set(categoryMapKey(categoryType, categoryName), {
-        id: record.id,
-        categoryType,
-        categoryName,
-        processorCategoryId,
-        syncStatus,
-    });
-}
-
-let matchedCategoryMap = null;
-
-if (subcategory === "N/A" && parentCategory === "Passes") {
-    matchedCategoryMap = categoryMapByTypeAndName.get(categoryMapKey("Parent Category", "Passes")) || null;
+if (!processorCategoryRecord) {
+    warnings.push("Processor category map could not be linked because no matching parent/subcategory record was resolved.");
 } else {
-    matchedCategoryMap = categoryMapByTypeAndName.get(categoryMapKey("Subcategory", subcategory)) || null;
-}
+    const categoryLabel = categoryMapLabel(processorCategoryRecord);
+    const processorCategoryId = getText(processorCategoryRecord, CATMAP.processorCategoryId);
+    const syncStatus = getSingleSelectName(processorCategoryRecord, CATMAP.syncStatus);
+    const catalogProcessor = getSingleSelectName(processorCategoryRecord, CATMAP.catalogProcessor);
+    const processorEnvironment = getSingleSelectName(processorCategoryRecord, CATMAP.processorEnvironment);
 
-if (!matchedCategoryMap) {
-    warnings.push(`No PROCESSOR CATEGORY MAP match found for ${subcategory === "N/A" ? parentCategory : subcategory}.`);
-} else if (!matchedCategoryMap.processorCategoryId || matchedCategoryMap.syncStatus !== "SYNCED") {
-    warnings.push(
-        `PROCESSOR CATEGORY MAP found for ${matchedCategoryMap.categoryName}, but it is not fully synced. Sync Status: ${matchedCategoryMap.syncStatus || "blank"}.`
-    );
+    if (catalogProcessor && catalogProcessor !== "SQUARE") {
+        warnings.push(`${categoryLabel} has Catalog Processor = ${catalogProcessor}, expected SQUARE.`);
+    }
+
+    if (processorEnvironment && processorEnvironment !== "PRODUCTION") {
+        warnings.push(`${categoryLabel} has Processor Environment = ${processorEnvironment}, expected PRODUCTION.`);
+    }
+
+    if (!processorCategoryId || syncStatus !== "SYNCED") {
+        warnings.push(`${categoryLabel} is not fully synced. Sync Status: ${syncStatus || "blank"}.`);
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -549,7 +515,7 @@ if (errors.length > 0) {
         [SUB.parserStatus]: { name: "Failed" },
         [SUB.status]: { name: "Needs Changes" },
         [SUB.parserNotes]: formatNotes([
-            `SUB-1 failed for ${submissionName}.`,
+            `SUB-1 v26.1.0 failed for ${submissionName}.`,
             "",
             "Errors:",
             ...errors.map((e) => `- ${e}`),
@@ -558,7 +524,7 @@ if (errors.length > 0) {
         ]),
     });
 
-    throw new Error(`SUB-1 failed for ${submissionName}: ${errors.join(" | ")}`);
+    throw new Error(`SUB-1 v26.1.0 failed for ${submissionName}: ${errors.join(" | ")}`);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -572,7 +538,7 @@ let preservedCount = 0;
 
 if (existingDraftIds.length > 0) {
     const draftQuery = await draftItemsTable.selectRecordsAsync({
-        fields: [DRAFT.draftStatus, DRAFT.inventorySubmission],
+        fields: [DRAFT.draftStatus],
     });
 
     const recordsToDelete = [];
@@ -605,18 +571,18 @@ if (existingDraftIds.length > 0) {
 ////////////////////////////////////////////////////////////////////////////////
 
 const designId = designIds[0] || null;
+const productTypeId = productTypeIds[0];
 const productionLocationId = productionLocationIds[0];
 
 let designName = "";
 let designCode = "";
 
 if (designId) {
-    const designsTable = base.getTable("DESIGNS");
     const designRecord = await designsTable.selectRecordAsync(designId);
 
     if (designRecord) {
-        designName = designRecord.getCellValueAsString("Design Name");
-        designCode = designRecord.getCellValueAsString("Design Code");
+        designName = getText(designRecord, DESIGN.name);
+        designCode = getText(designRecord, DESIGN.code);
     }
 }
 
@@ -625,7 +591,7 @@ if (!designName && isPass) {
 }
 
 if (!designCode && isPass) {
-    designCode = productCode;
+    designCode = productTypeCode;
 }
 
 if (!designName) {
@@ -646,7 +612,7 @@ const seenSkus = new Set();
 for (const entry of entries) {
     const draftSku = makeSku({
         designCode,
-        productCode,
+        productCode: productTypeCode,
         colorCode: entry.colorCode,
         sizeCode: entry.sizeCode,
     });
@@ -665,7 +631,7 @@ for (const entry of entries) {
 
     const itemName = buildItemName({
         designName,
-        draftProductType,
+        productTypeName,
     });
 
     const variantName = buildVariantName({
@@ -677,10 +643,19 @@ for (const entry of entries) {
 
     const itemWarnings = [];
 
-    if (!matchedCategoryMap) {
-        itemWarnings.push("Processor category map not found.");
-    } else if (!matchedCategoryMap.processorCategoryId || matchedCategoryMap.syncStatus !== "SYNCED") {
-        itemWarnings.push("Processor category map is not fully synced.");
+    if (productTypeStatus !== "Approved") {
+        itemWarnings.push(`Product Type is not Approved. Current status: ${productTypeStatus || "blank"}.`);
+    }
+
+    if (!processorCategoryRecord) {
+        itemWarnings.push("Processor category map was not resolved.");
+    } else {
+        const processorCategoryId = getText(processorCategoryRecord, CATMAP.processorCategoryId);
+        const syncStatus = getSingleSelectName(processorCategoryRecord, CATMAP.syncStatus);
+
+        if (!processorCategoryId || syncStatus !== "SYNCED") {
+            itemWarnings.push(`Processor category map is not fully synced. Sync Status: ${syncStatus || "blank"}.`);
+        }
     }
 
     if (imageAttachments.length === 0 && entry.colorCode !== "NOC") {
@@ -695,11 +670,10 @@ for (const entry of entries) {
             [DRAFT.draftStatus]: { name: "Draft" },
             [DRAFT.inventorySubmission]: [{ id: submission.id }],
             ...(designId ? { [DRAFT.design]: [{ id: designId }] } : {}),
-            [DRAFT.productType]: { name: draftProductTypeSelectValue },
-            ...(writeNewProductType ? { [DRAFT.newProductType]: writeNewProductType } : {}),
-            [DRAFT.parentCategory]: { name: parentCategory },
-            ...(subcategory !== "N/A" ? { [DRAFT.subcategory]: { name: subcategory } } : {}),
-            ...(matchedCategoryMap ? { [DRAFT.processorCategoryMap]: [{ id: matchedCategoryMap.id }] } : {}),
+            [DRAFT.productTypes]: [{ id: productTypeId }],
+            [DRAFT.parentCategory]: { name: parentCategoryName },
+            ...(subcategoryName ? { [DRAFT.subcategory]: { name: subcategoryName } } : {}),
+            ...(processorCategoryRecord ? { [DRAFT.processorCategoryMap]: [{ id: processorCategoryRecord.id }] } : {}),
             [DRAFT.colorFamily]: { name: entry.colorCode },
             [DRAFT.size]: { name: entry.sizeCode },
             [DRAFT.itemName]: itemName,
@@ -710,7 +684,7 @@ for (const entry of entries) {
             [DRAFT.startingProductionQuantity]: entry.quantity,
             [DRAFT.productionLocation]: [{ id: productionLocationId }],
             ...(imageAttachments.length > 0 ? { [DRAFT.productImage]: imageAttachments } : {}),
-            [DRAFT.imageGroupKey]: `${designCode || "NO-DESIGN"}-${productCode}-${entry.colorCode}`,
+            [DRAFT.imageGroupKey]: `${designCode || "NO-DESIGN"}-${productTypeCode}-${entry.colorCode}`,
             [DRAFT.validationStatus]: { name: validationStatus },
             [DRAFT.validationNotes]: formatNotes(itemWarnings),
             [DRAFT.processingStatus]: { name: "Not Processed" },
@@ -736,30 +710,34 @@ await submissionsTable.updateRecordAsync(submission.id, {
     [SUB.parserStatus]: { name: finalParserStatus },
     [SUB.status]: { name: finalSubmissionStatus },
     [SUB.parserNotes]: formatNotes([
-        `SUB-1 completed for ${submissionName}.`,
+        `SUB-1 v26.1.0 completed for ${submissionName}.`,
         `Created draft items: ${createdCount}`,
         `Deleted old draft items: ${deletedCount}`,
         `Preserved old draft items: ${preservedCount}`,
         "",
-        ...(newProductType
-            ? [
-                  "New Product Type:",
-                  `- ${newProductType}`,
-                  `- Generated Product Type Code: ${productCode}`,
-                  "",
-              ]
-            : []),
+        "Product Type:",
+        `- Name: ${productTypeName}`,
+        `- Code: ${productTypeCode}`,
+        `- Status: ${productTypeStatus || "blank"}`,
+        "",
+        "Category Resolution:",
+        `- Parent Category: ${parentCategoryName || "blank"}`,
+        `- Subcategory: ${subcategoryName || "N/A"}`,
+        `- Processor Category Map: ${processorCategoryRecord ? categoryMapLabel(processorCategoryRecord) : "blank"}`,
+        "",
         ...(warnings.length ? ["Warnings:", ...warnings.map((w) => `- ${w}`)] : ["No warnings."]),
     ]),
 });
 
 output.set("submissionRecordId", submission.id);
 output.set("submissionId", submissionName);
+output.set("productTypeId", productTypeId);
+output.set("productTypeName", productTypeName);
+output.set("productTypeCode", productTypeCode);
+output.set("productTypeStatus", productTypeStatus || "");
 output.set("createdDraftItemCount", createdCount);
 output.set("deletedOldDraftItemCount", deletedCount);
 output.set("preservedOldDraftItemCount", preservedCount);
 output.set("parserStatus", finalParserStatus);
-output.set("newProductType", newProductType || "");
-output.set("generatedProductTypeCode", newProductType ? productCode : "");
 
-console.log(`SUB-1 complete for ${submissionName}. Created ${createdCount} draft item(s).`);
+console.log(`SUB-1 v26.1.0 complete for ${submissionName}. Created ${createdCount} draft item(s).`);
