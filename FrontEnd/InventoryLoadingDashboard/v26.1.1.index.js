@@ -242,8 +242,13 @@ function InventorySubmissionForm({
 
     const canSubmit =
         submittedById &&
+        designId &&
         productTypeId &&
         productionLocationId &&
+        unitPrice !== '' &&
+        unitCost !== '' &&
+        cleanNumberInput(unitPrice) !== null &&
+        cleanNumberInput(unitCost) !== null &&
         hasAnyPositiveQuantity(quantities, nocQty) &&
         !hasInvalidQuantity(quantities, nocQty) &&
         !isSubmitting;
@@ -283,13 +288,21 @@ function InventorySubmissionForm({
             return;
         }
 
-        if (!submittedById || !productTypeId || !productionLocationId) {
+        if (!submittedById || !designId || !productTypeId || !productionLocationId) {
             setBanner({
                 type: 'error',
-                message: 'Submitted By, Product Type, and Production Location are required.',
+                message: 'Submitted By, Design, Product Type, and Production Location are required.',
             });
             return;
         }
+
+if (cleanNumberInput(unitPrice) === null || cleanNumberInput(unitCost) === null) {
+    setBanner({
+        type: 'error',
+        message: 'Unit Price and Unit Cost are required and must be valid numbers.',
+    });
+    return;
+}
 
         setIsSubmitting(true);
         setBanner({
@@ -423,7 +436,7 @@ function InventorySubmissionForm({
                 </label>
 
                 <label className="form-field">
-                    <span>Design</span>
+                    <span>Design *</span>
                     <select value={designId} onChange={(event) => setDesignId(event.target.value)}>
                         <option value="">Select design...</option>
                         {designRecords.map((record) => (
@@ -432,7 +445,7 @@ function InventorySubmissionForm({
                             </option>
                         ))}
                     </select>
-                    <small>Required for normal merch. Optional for pass-style submissions.</small>
+                    <small>* = Required field.</small>
                 </label>
 
                 <label className="form-field">
@@ -468,7 +481,7 @@ function InventorySubmissionForm({
                 </label>
 
                 <label className="form-field">
-                    <span>Unit Price</span>
+                    <span>Unit Price *</span>
                     <input
                         type="number"
                         min="0"
@@ -480,7 +493,7 @@ function InventorySubmissionForm({
                 </label>
 
                 <label className="form-field">
-                    <span>Unit Cost</span>
+                    <span>Unit Cost *</span>
                     <input
                         type="number"
                         min="0"
