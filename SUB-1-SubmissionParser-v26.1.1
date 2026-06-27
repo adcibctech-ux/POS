@@ -1,5 +1,5 @@
 ////////////////////////////////////////////////////////////////////////////////
-// SUB-1-SubmissionParser-v26.1.0
+// SUB-1-SubmissionParser-v26.1.1
 // POS Backend | INVENTORY SUBMISSIONS → DRAFT ITEMS
 //
 // PURPOSE
@@ -25,6 +25,24 @@
 //   - Missing/unsynced processor category maps create warnings.
 //
 // UPDATES / BUG FIXES
+//
+//   v26.1.1
+//   - Schema alignment patch for finalized PRODUCT TYPES linked-field naming.
+//   - Updated INVENTORY SUBMISSIONS product type source field from {PRODUCT TYPES}
+//     to {Product Type}, assuming {Product Type} is now the linked record field.
+//   - Updated DRAFT ITEMS product type destination field from {PRODUCT TYPES}
+//     to {Product Type}.
+//   - Removed direct writes to DRAFT ITEMS {Parent Category} and {Subcategory}
+//     because those fields are now lookup fields derived from linked {Product Type}.
+//   - Removed direct writes to DRAFT ITEMS {Processor Category Map} because the
+//     staging table no longer needs a writable processor category map field.
+//   - Parser still validates the linked PRODUCT TYPES record, including Product Type
+//     Status, Product Type Code, Parent Category, Subcategory, and category sync state.
+//   - Parser now relies on Airtable lookups in DRAFT ITEMS to display parent category
+//     and subcategory context after the linked Product Type is written.
+//   - No changes to BLK/WHT/GRY/COL/NOC quantity parsing behavior.
+//   - No changes to safe regeneration behavior for existing Draft-status draft items.
+//
 //   v26.1.0
 //   - Major revision: PRODUCT TYPES linked records are now the source of truth.
 //   - Ignores legacy INVENTORY SUBMISSIONS {Product Type} single select entirely.
@@ -74,7 +92,7 @@ const SUB = {
     submissionId: "Submission ID",
     status: "Submission Status",
     design: "Design",
-    productTypes: "PRODUCT TYPES",
+    productTypes: "Product Type",
     unitPrice: "Unit Price",
     unitCost: "Unit Cost",
     productionLocation: "Production Location",
@@ -88,10 +106,7 @@ const DRAFT = {
     draftStatus: "Draft Status",
     inventorySubmission: "Inventory Submission",
     design: "Design",
-    productTypes: "PRODUCT TYPES",
-    parentCategory: "Parent Category",
-    subcategory: "Subcategory",
-    processorCategoryMap: "Processor Category Map",
+    productTypes: "Product Type",
     colorFamily: "Color Family",
     size: "Size",
     itemName: "Item Name",
@@ -671,9 +686,6 @@ for (const entry of entries) {
             [DRAFT.inventorySubmission]: [{ id: submission.id }],
             ...(designId ? { [DRAFT.design]: [{ id: designId }] } : {}),
             [DRAFT.productTypes]: [{ id: productTypeId }],
-            [DRAFT.parentCategory]: { name: parentCategoryName },
-            ...(subcategoryName ? { [DRAFT.subcategory]: { name: subcategoryName } } : {}),
-            ...(processorCategoryRecord ? { [DRAFT.processorCategoryMap]: [{ id: processorCategoryRecord.id }] } : {}),
             [DRAFT.colorFamily]: { name: entry.colorCode },
             [DRAFT.size]: { name: entry.sizeCode },
             [DRAFT.itemName]: itemName,
