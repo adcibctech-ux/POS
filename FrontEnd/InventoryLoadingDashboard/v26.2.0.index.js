@@ -33,14 +33,6 @@ const SUB_FIELDS = {
     submissionNotes: 'Submission Notes',
 };
 
-const OPTIONAL_IMAGE_FIELDS = {
-    BLK: 'BLK Image',
-    WHT: 'WHT Image',
-    GRY: 'GRY Image',
-    COL: 'COL Image',
-    NOC: 'NOC Image',
-};
-
 const DRAFT_FIELDS = {
     draftSku: 'Draft SKU',
     draftStatus: 'Draft Status',
@@ -64,19 +56,11 @@ const DRAFT_FIELDS = {
 };
 
 const QUANTITY_COLORS = ['BLK', 'WHT', 'GRY', 'COL'];
-const IMAGE_BUCKETS = ['BLK', 'WHT', 'GRY', 'COL', 'NOC'];
 const QUANTITY_SIZES = ['OS', 'YS', 'YM', 'YL', 'XS', 'SM', 'MD', 'LG', 'XL', '2X', '3X'];
 
-// Paste final URLs here once created.
-// These can be Airtable web form URLs or interface/form page URLs.
-// Web forms are usually cleaner for "add new record" from inside a custom extension.
-const DESIGN_FORM_URL = '';
-const PRODUCT_TYPE_FORM_URL = '';
-
-// Paste a hosted logo URL here.
-// Best option: upload the logo to Airtable/website/cloud storage and use a direct image URL.
-// Local terminal files are not reliable unless bundled intentionally.
-const LOGO_URL = '';
+const DESIGN_FORM_URL = 'https://airtable.com/appOuXOVKVDx2LVji/paghOBkG6Hu1ktvPC';
+const PRODUCT_TYPE_FORM_URL = 'https://airtable.com/appOuXOVKVDx2LVji/pagHhaXIbxc0az57X';
+const LOGO_URL = 'https://raw.githubusercontent.com/adcibctech-ux/POS/main/2026%20LOGO%20TRANSPARENT-CROPPED.png';
 
 function getTableOrNull(base, tableName) {
     try {
@@ -193,30 +177,6 @@ function buildQuantityFields(quantities, nocQty) {
     return fields;
 }
 
-function isUsableUrl(value) {
-    const trimmed = String(value || '').trim();
-
-    if (!trimmed) return false;
-
-    return /^https?:\/\//i.test(trimmed);
-}
-
-function buildImageAttachmentFields(submissionsTable, imageUrls) {
-    const fields = {};
-
-    for (const bucket of IMAGE_BUCKETS) {
-        const fieldName = OPTIONAL_IMAGE_FIELDS[bucket];
-        const url = String(imageUrls[bucket] || '').trim();
-
-        if (!url || !isUsableUrl(url)) continue;
-        if (!getFieldOrNull(submissionsTable, fieldName)) continue;
-
-        fields[fieldName] = [{url}];
-    }
-
-    return fields;
-}
-
 function chunkArray(array, size) {
     const chunks = [];
 
@@ -298,7 +258,6 @@ function InventorySubmissionForm({
     const [submissionNotes, setSubmissionNotes] = useState('');
     const [quantities, setQuantities] = useState({});
     const [nocQty, setNocQty] = useState('');
-    const [imageUrls, setImageUrls] = useState({});
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [lastSubmissionId, setLastSubmissionId] = useState('');
     const [banner, setBanner] = useState(null);
@@ -325,10 +284,6 @@ function InventorySubmissionForm({
         !hasInvalidQuantity(quantities, nocQty) &&
         !isSubmitting;
 
-    const imageBucketsWithExistingFields = IMAGE_BUCKETS.filter((bucket) => {
-        return getFieldOrNull(submissionsTable, OPTIONAL_IMAGE_FIELDS[bucket]);
-    });
-
     function resetFormAfterSubmit() {
         setDesignId('');
         setProductTypeId('');
@@ -338,20 +293,12 @@ function InventorySubmissionForm({
         setSubmissionNotes('');
         setQuantities({});
         setNocQty('');
-        setImageUrls({});
     }
 
     function updateQuantity(fieldName, value) {
         setQuantities((current) => ({
             ...current,
             [fieldName]: value,
-        }));
-    }
-
-    function updateImageUrl(bucket, value) {
-        setImageUrls((current) => ({
-            ...current,
-            [bucket]: value,
         }));
     }
 
@@ -388,19 +335,6 @@ function InventorySubmissionForm({
             return;
         }
 
-        const invalidImageBucket = IMAGE_BUCKETS.find((bucket) => {
-            const url = String(imageUrls[bucket] || '').trim();
-            return url && !isUsableUrl(url);
-        });
-
-        if (invalidImageBucket) {
-            setBanner({
-                type: 'error',
-                message: `${invalidImageBucket} image must be a valid URL beginning with http:// or https://, or left blank.`,
-            });
-            return;
-        }
-
         setIsSubmitting(true);
         setBanner({
             type: 'info',
@@ -419,7 +353,6 @@ function InventorySubmissionForm({
                 [SUB_FIELDS.unitPrice]: cleanNumberInput(unitPrice),
                 [SUB_FIELDS.unitCost]: cleanNumberInput(unitCost),
                 ...buildQuantityFields(quantities, nocQty),
-                ...buildImageAttachmentFields(submissionsTable, imageUrls),
             };
 
             if (submissionNotes.trim()) {
@@ -452,7 +385,7 @@ function InventorySubmissionForm({
                 <Box>
                     <Heading size="medium">(1) Add Inventory By Design + Product Type</Heading>
                     <Text textColor="light">
-                        Add quantities by color/size. Images are optional and can be added later if needed.
+                        Add quantities by color/size. Images can be added later in section (2) if needed.
                     </Text>
                 </Box>
 
@@ -654,29 +587,6 @@ function InventorySubmissionForm({
                 </Box>
             </Box>
 
-            {imageBucketsWithExistingFields.length > 0 && (
-                <Box marginTop={4}>
-                    <Heading size="small">Product Images</Heading>
-                    <Text textColor="light">
-                        Optional. Paste direct image URLs only. Blank image fields will not block submission or review.
-                    </Text>
-
-                    <Box className="image-url-grid" marginTop={3}>
-                        {imageBucketsWithExistingFields.map((bucket) => (
-                            <label className="form-field" key={bucket}>
-                                <span>{bucket} Image URL</span>
-                                <input
-                                    type="url"
-                                    value={imageUrls[bucket] || ''}
-                                    onChange={(event) => updateImageUrl(bucket, event.target.value)}
-                                    placeholder="https://..."
-                                />
-                            </label>
-                        ))}
-                    </Box>
-                </Box>
-            )}
-
             <Box className="form-actions">
                 <Button
                     variant="primary"
@@ -767,7 +677,7 @@ function DraftItemsGrid({draftItemsTable, notificationContactsTable}) {
             const updates = visibleDrafts.map((record) => ({
                 id: record.id,
                 fields: {
-                    [DRAFT_FIELDS.draftStatus]: {name: 'Ready for Ari Review'},
+                    [DRAFT_FIELDS.draftStatus]: {name: 'Ready for Review'},
                     [DRAFT_FIELDS.reviewedBy]: [{id: reviewedById}],
                     [DRAFT_FIELDS.reviewedAt]: reviewedAt,
                 },
@@ -801,8 +711,9 @@ function DraftItemsGrid({draftItemsTable, notificationContactsTable}) {
                 <Box>
                     <Heading size="medium">(2) Review Items for Submission</Heading>
                     <Text textColor="light">
-                        To edit images or full record details, click <strong>Open</strong> on the draft item.
-                        Image edits happen directly in the Airtable record detail panel.
+                        To edit item details or upload product images, click <strong>Open</strong> on the draft item.
+                        Product images are optional. Only one draft item per image/color group needs the image uploaded;
+                        IT will fix image placement during processing if needed.
                     </Text>
                 </Box>
 
@@ -1002,7 +913,7 @@ function InventoryLoadingDashboard() {
                 <Box className="hero-inner">
                     <Box className="hero-logo-wrap">
                         {LOGO_URL ? (
-                            <img src={LOGO_URL} alt="ADC|IBC logo" className="hero-logo" />
+                            <img src={LOGO_URL} alt="" className="hero-logo" />
                         ) : (
                             <Box className="hero-logo-placeholder">
                                 ADC
