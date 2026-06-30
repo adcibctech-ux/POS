@@ -673,9 +673,6 @@ for (const entry of entries) {
         }
     }
 
-    if (imageAttachments.length === 0 && entry.colorCode !== "NOC") {
-        itemWarnings.push(`No image found for ${entry.colorCode}.`);
-    }
 
     const validationStatus = itemWarnings.length > 0 || warnings.length > 0 ? "Warning" : "Valid";
 
