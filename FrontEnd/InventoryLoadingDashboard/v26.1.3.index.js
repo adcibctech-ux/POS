@@ -33,6 +33,14 @@ const SUB_FIELDS = {
     submissionNotes: 'Submission Notes',
 };
 
+const OPTIONAL_IMAGE_FIELDS = {
+    BLK: 'BLK Image',
+    WHT: 'WHT Image',
+    GRY: 'GRY Image',
+    COL: 'COL Image',
+    NOC: 'NOC Image',
+};
+
 const DRAFT_FIELDS = {
     draftSku: 'Draft SKU',
     draftStatus: 'Draft Status',
@@ -56,10 +64,19 @@ const DRAFT_FIELDS = {
 };
 
 const QUANTITY_COLORS = ['BLK', 'WHT', 'GRY', 'COL'];
+const IMAGE_BUCKETS = ['BLK', 'WHT', 'GRY', 'COL', 'NOC'];
 const QUANTITY_SIZES = ['OS', 'YS', 'YM', 'YL', 'XS', 'SM', 'MD', 'LG', 'XL', '2X', '3X'];
 
+// Paste final URLs here once created.
+// These can be Airtable web form URLs or interface/form page URLs.
+// Web forms are usually cleaner for "add new record" from inside a custom extension.
 const DESIGN_FORM_URL = '';
 const PRODUCT_TYPE_FORM_URL = '';
+
+// Paste a hosted logo URL here.
+// Best option: upload the logo to Airtable/website/cloud storage and use a direct image URL.
+// Local terminal files are not reliable unless bundled intentionally.
+const LOGO_URL = '';
 
 function getTableOrNull(base, tableName) {
     try {
@@ -92,6 +109,28 @@ function statusBadgeClass(status) {
     if (status === 'Warning') return 'badge badge-warning';
     if (status === 'Error') return 'badge badge-error';
     return 'badge';
+}
+
+function parserBannerClass(parserStatus) {
+    if (parserStatus === 'Failed') return 'notice notice-error';
+    if (parserStatus === 'Parsed' || parserStatus === 'Needs Review') return 'notice notice-success';
+    return 'notice notice-warning';
+}
+
+function parserBannerMessage(parserStatus) {
+    if (parserStatus === 'Failed') {
+        return 'Parsing failed. IT has been notified if the system alert automation is enabled. Review the submission parser notes or system alerts before retrying.';
+    }
+
+    if (parserStatus === 'Parsed') {
+        return 'Inventory batch parsed successfully. Draft items should now appear in the review grid below.';
+    }
+
+    if (parserStatus === 'Needs Review') {
+        return 'Inventory batch parsed with warnings. Draft items should now appear in the review grid below and can still be submitted for IT processing.';
+    }
+
+    return 'Inventory batch submitted. The parser is processing this batch into draft items.';
 }
 
 function quantityFieldName(colorCode, sizeCode) {
@@ -149,6 +188,30 @@ function buildQuantityFields(quantities, nocQty) {
 
     if (nocNumber !== null && nocNumber > 0) {
         fields['NOC OS Qty'] = nocNumber;
+    }
+
+    return fields;
+}
+
+function isUsableUrl(value) {
+    const trimmed = String(value || '').trim();
+
+    if (!trimmed) return false;
+
+    return /^https?:\/\//i.test(trimmed);
+}
+
+function buildImageAttachmentFields(submissionsTable, imageUrls) {
+    const fields = {};
+
+    for (const bucket of IMAGE_BUCKETS) {
+        const fieldName = OPTIONAL_IMAGE_FIELDS[bucket];
+        const url = String(imageUrls[bucket] || '').trim();
+
+        if (!url || !isUsableUrl(url)) continue;
+        if (!getFieldOrNull(submissionsTable, fieldName)) continue;
+
+        fields[fieldName] = [{url}];
     }
 
     return fields;
@@ -235,6 +298,7 @@ function InventorySubmissionForm({
     const [submissionNotes, setSubmissionNotes] = useState('');
     const [quantities, setQuantities] = useState({});
     const [nocQty, setNocQty] = useState('');
+    const [imageUrls, setImageUrls] = useState({});
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [lastSubmissionId, setLastSubmissionId] = useState('');
     const [banner, setBanner] = useState(null);
@@ -246,10 +310,6 @@ function InventorySubmissionForm({
 
     const latestParserStatus = lastSubmissionRecord
         ? cellText(lastSubmissionRecord, SUB_FIELDS.parserStatus)
-        : '';
-
-    const latestSubmissionStatus = lastSubmissionRecord
-        ? cellText(lastSubmissionRecord, SUB_FIELDS.submissionStatus)
         : '';
 
     const canSubmit =
@@ -265,6 +325,10 @@ function InventorySubmissionForm({
         !hasInvalidQuantity(quantities, nocQty) &&
         !isSubmitting;
 
+    const imageBucketsWithExistingFields = IMAGE_BUCKETS.filter((bucket) => {
+        return getFieldOrNull(submissionsTable, OPTIONAL_IMAGE_FIELDS[bucket]);
+    });
+
     function resetFormAfterSubmit() {
         setDesignId('');
         setProductTypeId('');
@@ -274,12 +338,20 @@ function InventorySubmissionForm({
         setSubmissionNotes('');
         setQuantities({});
         setNocQty('');
+        setImageUrls({});
     }
 
     function updateQuantity(fieldName, value) {
         setQuantities((current) => ({
             ...current,
             [fieldName]: value,
+        }));
+    }
+
+    function updateImageUrl(bucket, value) {
+        setImageUrls((current) => ({
+            ...current,
+            [bucket]: value,
         }));
     }
 
@@ -316,6 +388,19 @@ function InventorySubmissionForm({
             return;
         }
 
+        const invalidImageBucket = IMAGE_BUCKETS.find((bucket) => {
+            const url = String(imageUrls[bucket] || '').trim();
+            return url && !isUsableUrl(url);
+        });
+
+        if (invalidImageBucket) {
+            setBanner({
+                type: 'error',
+                message: `${invalidImageBucket} image must be a valid URL beginning with http:// or https://, or left blank.`,
+            });
+            return;
+        }
+
         setIsSubmitting(true);
         setBanner({
             type: 'info',
@@ -334,6 +419,7 @@ function InventorySubmissionForm({
                 [SUB_FIELDS.unitPrice]: cleanNumberInput(unitPrice),
                 [SUB_FIELDS.unitCost]: cleanNumberInput(unitCost),
                 ...buildQuantityFields(quantities, nocQty),
+                ...buildImageAttachmentFields(submissionsTable, imageUrls),
             };
 
             if (submissionNotes.trim()) {
@@ -348,7 +434,7 @@ function InventorySubmissionForm({
             setBanner({
                 type: 'success',
                 message:
-                    'Inventory submission created. SUB-1 will parse it through the Airtable automation. Images are optional and can be added later from the opened submission or draft item records.',
+                    'Inventory batch submitted. The parser will create draft items for review in section (2).',
             });
         } catch (error) {
             setBanner({
@@ -364,7 +450,7 @@ function InventorySubmissionForm({
         <Box className="card">
             <Box className="section-header">
                 <Box>
-                    <Heading size="medium">(1) Add New Inventory By Design + Product Type</Heading>
+                    <Heading size="medium">(1) Add Inventory By Design + Product Type</Heading>
                     <Text textColor="light">
                         Add quantities by color/size. Images are optional and can be added later if needed.
                     </Text>
@@ -396,6 +482,8 @@ function InventorySubmissionForm({
                             ? 'notice-error'
                             : banner.type === 'success'
                             ? 'notice-success'
+                            : banner.type === 'warning'
+                            ? 'notice-warning'
                             : 'notice-info'
                     }`}
                     marginTop={3}
@@ -405,20 +493,8 @@ function InventorySubmissionForm({
             )}
 
             {lastSubmissionRecord && (
-                <Box className="notice notice-info" marginTop={3}>
-                    <Box className="section-header">
-                        <Box>
-                            <Text fontWeight="strong">Latest submission status</Text>
-                            <Text>
-                                Submission Status: {latestSubmissionStatus || '—'} | Parser Status:{' '}
-                                {latestParserStatus || '—'}
-                            </Text>
-                        </Box>
-
-                        <Button size="small" onClick={() => expandRecord(lastSubmissionRecord)}>
-                            Open Submission
-                        </Button>
-                    </Box>
+                <Box className={parserBannerClass(latestParserStatus)} marginTop={3}>
+                    <Text>{parserBannerMessage(latestParserStatus)}</Text>
                 </Box>
             )}
 
@@ -433,6 +509,7 @@ function InventorySubmissionForm({
                             </option>
                         ))}
                     </select>
+                    <small>* = Required field.</small>
                 </label>
 
                 <label className="form-field">
@@ -445,7 +522,6 @@ function InventorySubmissionForm({
                             </option>
                         ))}
                     </select>
-                    <small>* = Required field.</small>
                 </label>
 
                 <label className="form-field">
@@ -578,6 +654,29 @@ function InventorySubmissionForm({
                 </Box>
             </Box>
 
+            {imageBucketsWithExistingFields.length > 0 && (
+                <Box marginTop={4}>
+                    <Heading size="small">Product Images</Heading>
+                    <Text textColor="light">
+                        Optional. Paste direct image URLs only. Blank image fields will not block submission or review.
+                    </Text>
+
+                    <Box className="image-url-grid" marginTop={3}>
+                        {imageBucketsWithExistingFields.map((bucket) => (
+                            <label className="form-field" key={bucket}>
+                                <span>{bucket} Image URL</span>
+                                <input
+                                    type="url"
+                                    value={imageUrls[bucket] || ''}
+                                    onChange={(event) => updateImageUrl(bucket, event.target.value)}
+                                    placeholder="https://..."
+                                />
+                            </label>
+                        ))}
+                    </Box>
+                </Box>
+            )}
+
             <Box className="form-actions">
                 <Button
                     variant="primary"
@@ -588,7 +687,7 @@ function InventorySubmissionForm({
                 </Button>
 
                 <Text textColor="light">
-                    After submission, SUB-1 parses the batch into Draft Items. Use Open Submission only if optional images or details need to be added.
+                    After submission, the batched inventory will be parsed into draft items which will be displayed in the grid below in section (2).
                 </Text>
             </Box>
         </Box>
@@ -702,20 +801,14 @@ function DraftItemsGrid({draftItemsTable, notificationContactsTable}) {
                 <Box>
                     <Heading size="medium">(2) Review Items for Submission</Heading>
                     <Text textColor="light">
-                        Showing all draft items where Draft Status = Draft and Processing Status = Not Processed.
+                        To edit images or full record details, click <strong>Open</strong> on the draft item.
+                        Image edits happen directly in the Airtable record detail panel.
                     </Text>
                 </Box>
 
                 <Box className="count-pill">
                     {visibleDrafts.length} draft item{visibleDrafts.length === 1 ? '' : 's'}
                 </Box>
-            </Box>
-
-            <Box className="notice notice-info" marginTop={3}>
-                <Text>
-                    To edit images or full record details, click <strong>Open</strong> on the draft item.
-                    Image edits happen directly in the Airtable record detail panel.
-                </Text>
             </Box>
 
             {reviewBanner && (
@@ -754,9 +847,6 @@ function DraftItemsGrid({draftItemsTable, notificationContactsTable}) {
             {visibleDrafts.length === 0 ? (
                 <Box className="empty-state">
                     <Heading size="small">No draft items waiting for review</Heading>
-                    <Text textColor="light">
-                        Once Aud submits an inventory batch and SUB-1 parses it, draft items will appear here.
-                    </Text>
                 </Box>
             ) : (
                 <Box className="draft-table-wrapper">
@@ -765,8 +855,6 @@ function DraftItemsGrid({draftItemsTable, notificationContactsTable}) {
                             <tr>
                                 <th>Open</th>
                                 <th>Draft SKU</th>
-                                <th>Submitted By</th>
-                                <th>Submitted At</th>
                                 <th>Design</th>
                                 <th>Product Type</th>
                                 <th>Color</th>
@@ -777,6 +865,8 @@ function DraftItemsGrid({draftItemsTable, notificationContactsTable}) {
                                 <th>Item Name</th>
                                 <th>Variant</th>
                                 <th>Validation</th>
+                                <th>Submitted By</th>
+                                <th>Submitted At</th>
                             </tr>
                         </thead>
 
@@ -795,8 +885,6 @@ function DraftItemsGrid({draftItemsTable, notificationContactsTable}) {
                                             </Button>
                                         </td>
                                         <td>{cellText(record, DRAFT_FIELDS.draftSku)}</td>
-                                        <td>{cellText(record, DRAFT_FIELDS.submittedBy)}</td>
-                                        <td>{cellText(record, DRAFT_FIELDS.submittedAt)}</td>
                                         <td>{cellText(record, DRAFT_FIELDS.designName)}</td>
                                         <td>{cellText(record, DRAFT_FIELDS.productTypes)}</td>
                                         <td>{cellText(record, DRAFT_FIELDS.colorFamily)}</td>
@@ -811,6 +899,8 @@ function DraftItemsGrid({draftItemsTable, notificationContactsTable}) {
                                                 {validationStatus || '—'}
                                             </span>
                                         </td>
+                                        <td>{cellText(record, DRAFT_FIELDS.submittedBy)}</td>
+                                        <td>{cellText(record, DRAFT_FIELDS.submittedAt)}</td>
                                     </tr>
                                 );
                             })}
@@ -823,7 +913,7 @@ function DraftItemsGrid({draftItemsTable, notificationContactsTable}) {
                 <Box>
                     <Heading size="small">Submit Draft Items for IT Processing</Heading>
                     <Text textColor="light">
-                        This will move all visible draft items out of Aud’s review queue and mark them ready for Ari/IT review.
+                        This will move all visible draft items out of the review queue and mark them ready for IT review.
                     </Text>
                 </Box>
 
@@ -909,28 +999,24 @@ function InventoryLoadingDashboard() {
     return (
         <Box className="app-shell">
             <Box className="hero">
-                <Box>
-                    <Text className="eyebrow">ADC|IBC POS Backend</Text>
-                    <Heading className="hero-title">Inventory Loading Dashboard</Heading>
-                    <Text className="hero-subtitle">
-                        Submit merch inventory batches, review generated draft items, and submit for IT processing.
-                    </Text>
-                </Box>
-            </Box>
+                <Box className="hero-inner">
+                    <Box className="hero-logo-wrap">
+                        {LOGO_URL ? (
+                            <img src={LOGO_URL} alt="ADC|IBC logo" className="hero-logo" />
+                        ) : (
+                            <Box className="hero-logo-placeholder">
+                                ADC
+                            </Box>
+                        )}
+                    </Box>
 
-            <Box className="card">
-                <Heading size="medium">Build Status</Heading>
-                <Text textColor="light">
-                    Version 2 creates inventory submissions and displays active draft items.
-                </Text>
-
-                <Box className="status-grid" marginTop={3}>
-                    {Object.entries(tables).map(([key, table]) => (
-                        <Box key={key} className={table ? 'status-card status-ok' : 'status-card status-missing'}>
-                            <Text fontWeight="strong">{TABLES[key]}</Text>
-                            <Text>{table ? 'Connected' : 'Missing'}</Text>
-                        </Box>
-                    ))}
+                    <Box className="hero-copy">
+                        <Text className="eyebrow">ADC|IBC Merchandise Management</Text>
+                        <Heading className="hero-title">Inventory Loading Dashboard</Heading>
+                        <Text className="hero-subtitle">
+                            Add new merchandise to inventory in batches, review generated draft items, and submit for IT processing.
+                        </Text>
+                    </Box>
                 </Box>
             </Box>
 
@@ -950,7 +1036,7 @@ function InventoryLoadingDashboard() {
                 />
             ) : (
                 <Box className="card">
-                    <Heading size="medium">(1) Add New Inventory By Design + Product Type</Heading>
+                    <Heading size="medium">(1) Add Inventory By Design + Product Type</Heading>
                     <Text textColor="light">
                         The form will load after required INVENTORY SUBMISSIONS fields are confirmed.
                     </Text>
