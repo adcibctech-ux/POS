@@ -51,6 +51,8 @@ const DRAFT_FIELDS = {
     validationStatus: 'Validation Status',
     productImage: 'Product Image',
     processingStatus: 'Processing Status',
+    reviewedBy: 'Reviewed By',
+    reviewedAt: 'Reviewed At',
 };
 
 const QUANTITY_COLORS = ['BLK', 'WHT', 'GRY', 'COL'];
@@ -150,6 +152,16 @@ function buildQuantityFields(quantities, nocQty) {
     }
 
     return fields;
+}
+
+function chunkArray(array, size) {
+    const chunks = [];
+
+    for (let i = 0; i < array.length; i += size) {
+        chunks.push(array.slice(i, i + size));
+    }
+
+    return chunks;
 }
 
 function MissingSetupNotice({missingTables, missingSubmissionFields, missingDraftFields}) {
@@ -296,13 +308,13 @@ function InventorySubmissionForm({
             return;
         }
 
-if (cleanNumberInput(unitPrice) === null || cleanNumberInput(unitCost) === null) {
-    setBanner({
-        type: 'error',
-        message: 'Unit Price and Unit Cost are required and must be valid numbers.',
-    });
-    return;
-}
+        if (cleanNumberInput(unitPrice) === null || cleanNumberInput(unitCost) === null) {
+            setBanner({
+                type: 'error',
+                message: 'Unit Price and Unit Cost are required and must be valid numbers.',
+            });
+            return;
+        }
 
         setIsSubmitting(true);
         setBanner({
@@ -316,25 +328,13 @@ if (cleanNumberInput(unitPrice) === null || cleanNumberInput(unitCost) === null)
                 [SUB_FIELDS.parserStatus]: {name: 'Not Parsed'},
                 [SUB_FIELDS.submittedBy]: [{id: submittedById}],
                 [SUB_FIELDS.submittedAt]: new Date().toISOString(),
+                [SUB_FIELDS.design]: [{id: designId}],
                 [SUB_FIELDS.productType]: [{id: productTypeId}],
                 [SUB_FIELDS.productionLocation]: [{id: productionLocationId}],
+                [SUB_FIELDS.unitPrice]: cleanNumberInput(unitPrice),
+                [SUB_FIELDS.unitCost]: cleanNumberInput(unitCost),
                 ...buildQuantityFields(quantities, nocQty),
             };
-
-            if (designId) {
-                fields[SUB_FIELDS.design] = [{id: designId}];
-            }
-
-            const parsedPrice = cleanNumberInput(unitPrice);
-            const parsedCost = cleanNumberInput(unitCost);
-
-            if (parsedPrice !== null) {
-                fields[SUB_FIELDS.unitPrice] = parsedPrice;
-            }
-
-            if (parsedCost !== null) {
-                fields[SUB_FIELDS.unitCost] = parsedCost;
-            }
 
             if (submissionNotes.trim()) {
                 fields[SUB_FIELDS.submissionNotes] = submissionNotes.trim();
@@ -595,8 +595,13 @@ if (cleanNumberInput(unitPrice) === null || cleanNumberInput(unitCost) === null)
     );
 }
 
-function DraftItemsGrid({draftItemsTable}) {
+function DraftItemsGrid({draftItemsTable, notificationContactsTable}) {
     const draftRecords = useRecords(draftItemsTable);
+    const contactRecords = useRecords(notificationContactsTable);
+
+    const [reviewedById, setReviewedById] = useState('');
+    const [isSubmittingForReview, setIsSubmittingForReview] = useState(false);
+    const [reviewBanner, setReviewBanner] = useState(null);
 
     const visibleDrafts = draftRecords
         .filter((record) => {
@@ -610,6 +615,86 @@ function DraftItemsGrid({draftItemsTable}) {
                 cellText(b, DRAFT_FIELDS.draftSku)
             );
         });
+
+    const errorDrafts = visibleDrafts.filter((record) => {
+        return cellText(record, DRAFT_FIELDS.validationStatus) === 'Error';
+    });
+
+    const warningDrafts = visibleDrafts.filter((record) => {
+        return cellText(record, DRAFT_FIELDS.validationStatus) === 'Warning';
+    });
+
+    const canSubmitForReview =
+        reviewedById &&
+        visibleDrafts.length > 0 &&
+        errorDrafts.length === 0 &&
+        !isSubmittingForReview;
+
+    async function submitAllDraftItemsForReview() {
+        if (!reviewedById) {
+            setReviewBanner({
+                type: 'error',
+                message: 'Select Reviewed By before submitting draft items for IT processing.',
+            });
+            return;
+        }
+
+        if (visibleDrafts.length === 0) {
+            setReviewBanner({
+                type: 'error',
+                message: 'There are no visible draft items to submit.',
+            });
+            return;
+        }
+
+        if (errorDrafts.length > 0) {
+            setReviewBanner({
+                type: 'error',
+                message:
+                    'Draft items with Validation Status = Error must be fixed before submission. Warning rows are allowed.',
+            });
+            return;
+        }
+
+        setIsSubmittingForReview(true);
+        setReviewBanner({
+            type: 'info',
+            message: 'Submitting draft items for IT processing...',
+        });
+
+        try {
+            const reviewedAt = new Date().toISOString();
+
+            const updates = visibleDrafts.map((record) => ({
+                id: record.id,
+                fields: {
+                    [DRAFT_FIELDS.draftStatus]: {name: 'Ready for Ari Review'},
+                    [DRAFT_FIELDS.reviewedBy]: [{id: reviewedById}],
+                    [DRAFT_FIELDS.reviewedAt]: reviewedAt,
+                },
+            }));
+
+            for (const batch of chunkArray(updates, 50)) {
+                await draftItemsTable.updateRecordsAsync(batch);
+            }
+
+            setReviewBanner({
+                type: 'success',
+                message: `${updates.length} draft item${
+                    updates.length === 1 ? '' : 's'
+                } submitted for IT processing.`,
+            });
+
+            setReviewedById('');
+        } catch (error) {
+            setReviewBanner({
+                type: 'error',
+                message: `Could not submit draft items for review: ${error.message}`,
+            });
+        } finally {
+            setIsSubmittingForReview(false);
+        }
+    }
 
     return (
         <Box className="card">
@@ -632,6 +717,39 @@ function DraftItemsGrid({draftItemsTable}) {
                     Image edits happen directly in the Airtable record detail panel.
                 </Text>
             </Box>
+
+            {reviewBanner && (
+                <Box
+                    className={`notice ${
+                        reviewBanner.type === 'error'
+                            ? 'notice-error'
+                            : reviewBanner.type === 'success'
+                            ? 'notice-success'
+                            : 'notice-info'
+                    }`}
+                    marginTop={3}
+                >
+                    <Text>{reviewBanner.message}</Text>
+                </Box>
+            )}
+
+            {warningDrafts.length > 0 && (
+                <Box className="notice notice-info" marginTop={3}>
+                    <Text>
+                        {warningDrafts.length} draft item{warningDrafts.length === 1 ? '' : 's'} currently have
+                        Validation Status = Warning. These can still be submitted for IT processing.
+                    </Text>
+                </Box>
+            )}
+
+            {errorDrafts.length > 0 && (
+                <Box className="notice notice-error" marginTop={3}>
+                    <Text>
+                        {errorDrafts.length} draft item{errorDrafts.length === 1 ? '' : 's'} currently have
+                        Validation Status = Error. These must be fixed before submission.
+                    </Text>
+                </Box>
+            )}
 
             {visibleDrafts.length === 0 ? (
                 <Box className="empty-state">
@@ -700,6 +818,42 @@ function DraftItemsGrid({draftItemsTable}) {
                     </table>
                 </Box>
             )}
+
+            <Box className="review-submit-panel">
+                <Box>
+                    <Heading size="small">Submit Draft Items for IT Processing</Heading>
+                    <Text textColor="light">
+                        This will move all visible draft items out of Aud’s review queue and mark them ready for Ari/IT review.
+                    </Text>
+                </Box>
+
+                <Box className="review-submit-controls">
+                    <label className="form-field review-by-field">
+                        <span>Reviewed By *</span>
+                        <select
+                            value={reviewedById}
+                            onChange={(event) => setReviewedById(event.target.value)}
+                        >
+                            <option value="">Select reviewer...</option>
+                            {contactRecords.map((record) => (
+                                <option key={record.id} value={record.id}>
+                                    {record.name}
+                                </option>
+                            ))}
+                        </select>
+                    </label>
+
+                    <Button
+                        variant="primary"
+                        disabled={!canSubmitForReview}
+                        onClick={submitAllDraftItemsForReview}
+                    >
+                        {isSubmittingForReview
+                            ? 'Submitting...'
+                            : 'Submit All Draft Items for IT Processing'}
+                    </Button>
+                </Box>
+            </Box>
         </Box>
     );
 }
@@ -747,7 +901,10 @@ function InventoryLoadingDashboard() {
         tables.notificationContacts &&
         missingSubmissionFields.length === 0;
 
-    const readyForDraftGrid = tables.draftItems && missingDraftFields.length === 0;
+    const readyForDraftGrid =
+        tables.draftItems &&
+        tables.notificationContacts &&
+        missingDraftFields.length === 0;
 
     return (
         <Box className="app-shell">
@@ -801,7 +958,10 @@ function InventoryLoadingDashboard() {
             )}
 
             {readyForDraftGrid ? (
-                <DraftItemsGrid draftItemsTable={tables.draftItems} />
+                <DraftItemsGrid
+                    draftItemsTable={tables.draftItems}
+                    notificationContactsTable={tables.notificationContacts}
+                />
             ) : (
                 <Box className="card">
                     <Heading size="medium">(2) Review Items for Submission</Heading>
