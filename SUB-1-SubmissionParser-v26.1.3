@@ -1,5 +1,5 @@
 ////////////////////////////////////////////////////////////////////////////////
-// SUB-1-SubmissionParser-v26.1.2
+// SUB-1-SubmissionParser-v26.1.3
 // POS Backend | INVENTORY SUBMISSIONS → DRAFT ITEMS
 //
 // PURPOSE
@@ -14,7 +14,7 @@
 //   When INVENTORY SUBMISSIONS record enters parsing-ready view:
 //   - Parser Status = Not Parsed or blank
 //   - Submission Status = Draft / submitted state
-//   - PRODUCT TYPES is populated
+//   - Product Type is populated
 //
 // SAFETY BEHAVIOR
 //   - Deletes old linked draft items ONLY when Draft Status is blank or "Draft".
@@ -25,8 +25,19 @@
 //   - Missing/unsynced processor category maps create warnings.
 //
 // UPDATES / BUG FIXES
+//   v26.1.3
+//   - Updated quantity parsing for new 3-letter size field codes.
+//   - Reads INVENTORY SUBMISSIONS quantity fields such as BLK ONE Qty,
+//     BLK YSM Qty, BLK AXS Qty, etc.
+//   - Generates SKUs using 3-letter size codes.
+//   - Writes DRAFT ITEMS {Size} using admin-facing labels:
+//     OS, YXS, YS, YM, YL, YXL, XS, SM, MD, LG, XL, 2X.
+//   - Removed 3X from parser size handling.
+//   - Updated NOC parsing from {NOC OS Qty} to {NOC ONE Qty}.
+//   - Keeps product images optional and does not warn when image fields are blank.
+//
 //   v26.1.2
-//   - Removed warning flag when no images are uploaded in submission. 
+//   - Removed warning flag when no images are uploaded in submission.
 //
 //   v26.1.1
 //   - Schema alignment patch for finalized PRODUCT TYPES linked-field naming.
@@ -42,7 +53,6 @@
 //     Status, Product Type Code, Parent Category, Subcategory, and category sync state.
 //   - Parser now relies on Airtable lookups in DRAFT ITEMS to display parent category
 //     and subcategory context after the linked Product Type is written.
-//   - No changes to BLK/WHT/GRY/COL/NOC quantity parsing behavior.
 //   - No changes to safe regeneration behavior for existing Draft-status draft items.
 //
 //   v26.1.0
@@ -51,7 +61,7 @@
 //   - Ignores legacy DRAFT ITEMS {Product Type} single select entirely.
 //   - Reads Product Type Name, Product Type Code, Parent Category, Subcategory,
 //     and Product Type Status from linked PRODUCT TYPES record.
-//   - Writes linked DRAFT ITEMS {PRODUCT TYPES} instead of old Product Type select.
+//   - Writes linked DRAFT ITEMS {Product Type} instead of old Product Type select.
 //   - Flags PRODUCT TYPES records that are not Approved.
 //   - Uses PRODUCT TYPES linked category records to determine parent/subcategory
 //     text and processor category map linkage.
@@ -158,12 +168,27 @@ const COLOR_BUCKETS = [
     { code: "COL", imageField: "COL Image" },
 ];
 
-const SIZE_CODES = ["OS", "YS", "YM", "YL", "XS", "SM", "MD", "LG", "XL", "2X", "3X"];
+const SIZE_CONFIGS = [
+    { fieldCode: "ONE", skuCode: "ONE", sizeLabel: "OS" },
+    { fieldCode: "YXS", skuCode: "YXS", sizeLabel: "YXS" },
+    { fieldCode: "YSM", skuCode: "YSM", sizeLabel: "YS" },
+    { fieldCode: "YMD", skuCode: "YMD", sizeLabel: "YM" },
+    { fieldCode: "YLG", skuCode: "YLG", sizeLabel: "YL" },
+    { fieldCode: "YXL", skuCode: "YXL", sizeLabel: "YXL" },
+    { fieldCode: "AXS", skuCode: "AXS", sizeLabel: "XS" },
+    { fieldCode: "ASM", skuCode: "ASM", sizeLabel: "SM" },
+    { fieldCode: "AMD", skuCode: "AMD", sizeLabel: "MD" },
+    { fieldCode: "ALG", skuCode: "ALG", sizeLabel: "LG" },
+    { fieldCode: "AXL", skuCode: "AXL", sizeLabel: "XL" },
+    { fieldCode: "A2X", skuCode: "A2X", sizeLabel: "2X" },
+];
 
 const NOC_BUCKET = {
     code: "NOC",
-    size: "OS",
-    qtyField: "NOC OS Qty",
+    fieldCode: "ONE",
+    skuCode: "ONE",
+    sizeLabel: "OS",
+    qtyField: "NOC ONE Qty",
 };
 
 const DRAFT_DELETE_STATUSES = new Set(["", "Draft"]);
@@ -207,9 +232,11 @@ function attachmentPayload(record, fieldName) {
 
 function chunkArray(array, size) {
     const chunks = [];
+
     for (let i = 0; i < array.length; i += size) {
         chunks.push(array.slice(i, i + size));
     }
+
     return chunks;
 }
 
@@ -234,9 +261,9 @@ function buildItemName({ designName, productTypeName }) {
     return [designName, productTypeName].filter(Boolean).join(" ");
 }
 
-function buildVariantName({ colorCode, sizeCode }) {
-    if (colorCode === "NOC" && sizeCode === "OS") return "One Size";
-    return `${colorCode} / ${sizeCode}`;
+function buildVariantName({ colorCode, sizeLabel }) {
+    if (colorCode === "NOC" && sizeLabel === "OS") return "One Size";
+    return `${colorCode} / ${sizeLabel}`;
 }
 
 function formatNotes(notes) {
@@ -249,8 +276,10 @@ function isWholeNumber(value) {
 
 function categoryMapLabel(categoryRecord) {
     if (!categoryRecord) return "Unknown Category";
+
     const categoryType = getSingleSelectName(categoryRecord, CATMAP.categoryType);
     const categoryName = getText(categoryRecord, CATMAP.categoryName);
+
     return `${categoryType || "Unknown Type"}: ${categoryName || "Unknown Name"}`;
 }
 
@@ -280,15 +309,17 @@ function validateQuantity(record, fieldName, errors) {
 function positiveQuantityEntriesForBucket(record, bucket, errors) {
     const entries = [];
 
-    for (const sizeCode of SIZE_CODES) {
-        const fieldName = `${bucket.code} ${sizeCode} Qty`;
+    for (const sizeConfig of SIZE_CONFIGS) {
+        const fieldName = `${bucket.code} ${sizeConfig.fieldCode} Qty`;
         const quantity = validateQuantity(record, fieldName, errors);
 
         if (quantity === null) continue;
 
         entries.push({
             colorCode: bucket.code,
-            sizeCode,
+            fieldCode: sizeConfig.fieldCode,
+            skuSizeCode: sizeConfig.skuCode,
+            sizeLabel: sizeConfig.sizeLabel,
             quantity,
             imageField: bucket.imageField,
         });
@@ -303,8 +334,10 @@ function positiveNocEntry(record, errors) {
     if (quantity === null) return null;
 
     return {
-        colorCode: "NOC",
-        sizeCode: "OS",
+        colorCode: NOC_BUCKET.code,
+        fieldCode: NOC_BUCKET.fieldCode,
+        skuSizeCode: NOC_BUCKET.skuCode,
+        sizeLabel: NOC_BUCKET.sizeLabel,
         quantity,
         imageField: null,
     };
@@ -335,7 +368,7 @@ const errors = [];
 ////////////////////////////////////////////////////////////////////////////////
 
 if (productTypeIds.length !== 1) {
-    errors.push(`PRODUCT TYPES must contain exactly one linked product type. Found ${productTypeIds.length}.`);
+    errors.push(`Product Type must contain exactly one linked product type. Found ${productTypeIds.length}.`);
 }
 
 let productTypeRecord = null;
@@ -390,6 +423,7 @@ let subcategoryRecord = null;
 
 if (productParentCategoryIds.length === 1) {
     parentCategoryRecord = await categoryMapTable.selectRecordAsync(productParentCategoryIds[0]);
+
     if (!parentCategoryRecord) {
         errors.push(`Linked Parent Category map could not be loaded: ${productParentCategoryIds[0]}`);
     }
@@ -397,6 +431,7 @@ if (productParentCategoryIds.length === 1) {
 
 if (productSubcategoryIds.length === 1) {
     subcategoryRecord = await categoryMapTable.selectRecordAsync(productSubcategoryIds[0]);
+
     if (!subcategoryRecord) {
         errors.push(`Linked Subcategory map could not be loaded: ${productSubcategoryIds[0]}`);
     }
@@ -503,7 +538,10 @@ for (const bucket of COLOR_BUCKETS) {
 }
 
 const nocEntry = positiveNocEntry(submission, errors);
-if (nocEntry) entries.push(nocEntry);
+
+if (nocEntry) {
+    entries.push(nocEntry);
+}
 
 if (entries.length === 0) {
     errors.push("No positive quantity fields were found to parse.");
@@ -511,13 +549,15 @@ if (entries.length === 0) {
 
 if (!isPass) {
     const invalidNoc = entries.find((entry) => entry.colorCode === "NOC");
+
     if (invalidNoc) {
-        warnings.push("NOC OS Qty is present on a non-pass submission. This will still parse, but should be reviewed.");
+        warnings.push("NOC ONE Qty is present on a non-pass submission. This will still parse, but should be reviewed.");
     }
 }
 
 if (isPass) {
     const nonNocEntries = entries.filter((entry) => entry.colorCode !== "NOC");
+
     if (nonNocEntries.length > 0) {
         warnings.push("Pass submission includes BLK/WHT/GRY/COL quantities. These will parse, but should be reviewed.");
     }
@@ -532,16 +572,16 @@ if (errors.length > 0) {
         [SUB.parserStatus]: { name: "Failed" },
         [SUB.status]: { name: "Needs Changes" },
         [SUB.parserNotes]: formatNotes([
-            `SUB-1 v26.1.0 failed for ${submissionName}.`,
+            `SUB-1 v26.1.3 failed for ${submissionName}.`,
             "",
             "Errors:",
-            ...errors.map((e) => `- ${e}`),
+            ...errors.map((error) => `- ${error}`),
             "",
-            ...(warnings.length ? ["Warnings:", ...warnings.map((w) => `- ${w}`)] : []),
+            ...(warnings.length ? ["Warnings:", ...warnings.map((warning) => `- ${warning}`)] : []),
         ]),
     });
 
-    throw new Error(`SUB-1 v26.1.0 failed for ${submissionName}: ${errors.join(" | ")}`);
+    throw new Error(`SUB-1 v26.1.3 failed for ${submissionName}: ${errors.join(" | ")}`);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -562,6 +602,7 @@ if (existingDraftIds.length > 0) {
 
     for (const draftId of existingDraftIds) {
         const draftRecord = draftQuery.getRecord(draftId);
+
         if (!draftRecord) continue;
 
         const draftStatus = getSingleSelectName(draftRecord, DRAFT.draftStatus);
@@ -631,11 +672,11 @@ for (const entry of entries) {
         designCode,
         productCode: productTypeCode,
         colorCode: entry.colorCode,
-        sizeCode: entry.sizeCode,
+        sizeCode: entry.skuSizeCode,
     });
 
     if (!draftSku) {
-        warnings.push(`Skipped a row because Draft SKU could not be generated for ${entry.colorCode} ${entry.sizeCode}.`);
+        warnings.push(`Skipped a row because Draft SKU could not be generated for ${entry.colorCode} ${entry.sizeLabel}.`);
         continue;
     }
 
@@ -653,7 +694,7 @@ for (const entry of entries) {
 
     const variantName = buildVariantName({
         colorCode: entry.colorCode,
-        sizeCode: entry.sizeCode,
+        sizeLabel: entry.sizeLabel,
     });
 
     const imageAttachments = entry.imageField ? attachmentPayload(submission, entry.imageField) : [];
@@ -675,6 +716,8 @@ for (const entry of entries) {
         }
     }
 
+    // Product images are optional.
+    // Do not warn when image fields are blank.
 
     const validationStatus = itemWarnings.length > 0 || warnings.length > 0 ? "Warning" : "Valid";
 
@@ -686,7 +729,7 @@ for (const entry of entries) {
             ...(designId ? { [DRAFT.design]: [{ id: designId }] } : {}),
             [DRAFT.productTypes]: [{ id: productTypeId }],
             [DRAFT.colorFamily]: { name: entry.colorCode },
-            [DRAFT.size]: { name: entry.sizeCode },
+            [DRAFT.size]: { name: entry.sizeLabel },
             [DRAFT.itemName]: itemName,
             [DRAFT.variantName]: variantName,
             [DRAFT.barcodeValue]: draftSku,
@@ -721,7 +764,7 @@ await submissionsTable.updateRecordAsync(submission.id, {
     [SUB.parserStatus]: { name: finalParserStatus },
     [SUB.status]: { name: finalSubmissionStatus },
     [SUB.parserNotes]: formatNotes([
-        `SUB-1 v26.1.0 completed for ${submissionName}.`,
+        `SUB-1 v26.1.3 completed for ${submissionName}.`,
         `Created draft items: ${createdCount}`,
         `Deleted old draft items: ${deletedCount}`,
         `Preserved old draft items: ${preservedCount}`,
@@ -736,7 +779,7 @@ await submissionsTable.updateRecordAsync(submission.id, {
         `- Subcategory: ${subcategoryName || "N/A"}`,
         `- Processor Category Map: ${processorCategoryRecord ? categoryMapLabel(processorCategoryRecord) : "blank"}`,
         "",
-        ...(warnings.length ? ["Warnings:", ...warnings.map((w) => `- ${w}`)] : ["No warnings."]),
+        ...(warnings.length ? ["Warnings:", ...warnings.map((warning) => `- ${warning}`)] : ["No warnings."]),
     ]),
 });
 
@@ -751,4 +794,4 @@ output.set("deletedOldDraftItemCount", deletedCount);
 output.set("preservedOldDraftItemCount", preservedCount);
 output.set("parserStatus", finalParserStatus);
 
-console.log(`SUB-1 v26.1.0 complete for ${submissionName}. Created ${createdCount} draft item(s).`);
+console.log(`SUB-1 v26.1.3 complete for ${submissionName}. Created ${createdCount} draft item(s).`);
