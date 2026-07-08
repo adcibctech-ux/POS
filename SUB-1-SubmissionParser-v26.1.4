@@ -1,5 +1,5 @@
 ////////////////////////////////////////////////////////////////////////////////
-// SUB-1-SubmissionParser-v26.1.3
+// SUB-1-SubmissionParser-v26.1.4
 // POS Backend | INVENTORY SUBMISSIONS → DRAFT ITEMS
 //
 // PURPOSE
@@ -25,6 +25,9 @@
 //   - Missing/unsynced processor category maps create warnings.
 //
 // UPDATES / BUG FIXES
+//   v26.1.4
+//   - Updated missing image warning flags.
+//
 //   v26.1.3
 //   - Updated quantity parsing for new 3-letter size field codes.
 //   - Reads INVENTORY SUBMISSIONS quantity fields such as BLK ONE Qty,
@@ -719,8 +722,8 @@ for (const entry of entries) {
     // Product images are optional.
     // Do not warn when image fields are blank.
 
-    const validationStatus = itemWarnings.length > 0 || warnings.length > 0 ? "Warning" : "Valid";
-
+    const validationStatus = itemWarnings.length > 0 ? "Warning" : "Valid";
+    
     createPayloads.push({
         fields: {
             [DRAFT.draftSku]: draftSku,
